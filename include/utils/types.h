@@ -28,7 +28,10 @@ typedef Eigen::Matrix3f M3F;
 struct Pose6D
 {
   /*** the preintegrated Lidar states at the time of IMU measurements in a frame ***/
-  double offset_time; // the offset time of IMU measurement w.r.t the first lidar point
+  // 表示当前的这个 IMU 测量时刻，相对于当前扫描帧（Scan）中第一个雷达点的时间偏差（时间差）
+  // offset_time 就是给每一个 IMU 数据打上一个局部的“相对时间戳”，告诉系统这个 IMU 数据发生在当前帧扫描开始后的第几毫秒。
+  // 这是进行 IMU 前向传播（积分） 和 雷达时间同步 的基石
+  double offset_time; // the offset time of IMU measurement w.r.t the first lidar point 该状态点相对于本帧第一个激光点的时间偏移量（单位通常是秒）
   double acc[3];      // the preintegrated total acceleration (global frame) at the Lidar origin
   double gyr[3];      // the unbiased angular velocity (body frame) at the Lidar origin
   double vel[3];      // the preintegrated velocity (global frame) at the Lidar origin
