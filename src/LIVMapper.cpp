@@ -220,36 +220,75 @@ void LIVMapper::initializeFiles()
         ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/mat_out.txt");
 }
 
+/*
+ * 作用：初始化 FAST-LIVO2 系统的 ROS 消息订阅者（Subscribers）、发布者（Publishers）以及定时器（Timers）。
+ * 功能：搭建算法核心与外界 ROS 数据交互的桥梁，负责接收传感器底层数据，并向外输出位姿、地图和调试可视化信息。
+ * 实现了什么：绑定了 LiDAR、IMU 和 Camera 的输入回调函数；分配了不同作用的点云、里程计、平面特征等输出话题（Topic）；设定了专用于无人机飞控（MAVROS）的位姿接口和高频 IMU 预积分定时发布器。
+ * 怎么实现的：
+ * 1. 传入常规的 ros::NodeHandle 和专门处理图像的 image_transport。
+ * 2. 根据雷达类型动态选择 Livox 自定义格式或标准 PointCloud2 格式的回调函数。
+ * 3. 统一使用极大的接收队列（200000）以防止优化耗时导致底层数据丢包。
+ * 4. 注册所有输出话题，并创建一个 250Hz (0.004s) 的定时器用于高频发布 IMU 传播状态。
+ */
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it)
 {
+    // 根据激光雷达型号选择相应的回调函数
     sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this) : nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
     sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
     sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
 
+    // 发布去畸变、配准到世界坐标系下的当前帧完整点云，Rviz中看到的
     pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
     pubNormal = nh.advertise<visualization_msgs::MarkerArray>("visualization_marker", 100);
+    // 发布视觉子图（Visual Sub-map）。FAST-LIVO2 的视觉后端会将 LiDAR 点云投影到图像平面，用于直接法（Direct Method）的光度误差对齐
     pubSubVisualMap = nh.advertise<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 100);
+    // 发布在 IESKF 优化中真正起到约束作用的有效特征点
     pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>("/cloud_effected", 100);
+    // 发布全局或增量式局部地图，用于整体建图结果的保存和展示
     pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>("/Laser_map", 100);
+
+    // 这是系统输出的最核心定位结果。/aft_mapped_to_init 包含了经过后端 LiDAR+视觉 联合优化后的高精度位姿
+    // （通常在 10Hz 左右，与雷达扫描频率一致）。/path 则将历史位姿连成线，在 RViz 中画出移动轨迹。
     pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>("/aft_mapped_to_init", 10);
     pubPath = nh.advertise<nav_msgs::Path>("/path", 10);
+
+    // 体素地图与平面特征可视化
     plane_pub = nh.advertise<visualization_msgs::Marker>("/planner_normal", 1);
     voxel_pub = nh.advertise<visualization_msgs::MarkerArray>("/voxels", 1);
+    voxelmap_manager->voxel_map_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+
+    // 动态环境滤除调试接口，为动态场景保留
     pubLaserCloudDyn = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj", 100);
     pubLaserCloudDynRmed = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_removed", 100);
     pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
+
+    // 无人机飞控集成与高频控制
     mavros_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
     pubImage = it.advertise("/rgb_img", 1);
-    pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
     imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
-    voxelmap_manager->voxel_map_pub_ = nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
+
+    // 使用 image_transport（专门用于在 ROS 中高效传输视频流的类）发布图像。它不仅用于监控原始画面，
+    // 通常也会叠加上 VIO 直接法追踪到的特征点、极线或光流轨迹，供开发者直观评估当前视觉对齐的效果
+    pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
+    
 }
 
+/**
+ * 多传感器系统时间戳的初始化与对齐
+ * 在主循环或数据同步完成后的第一步被调用，用于确立整个系统的时间基准
+ * 多传感器融合最怕“时空错位”。FAST-LIVO2 将 LiDAR 点云作为核心的空间观测数据，
+ * 因此将接收到的第一帧有效 LiDAR 数据的扫描结束时间（或特征提取时间）作为整个系统的时间原点（零时刻）。
+ */
 void LIVMapper::handleFirstFrame()
 {
+    // 如果还没有处理过第一帧
     if (!is_first_frame)
     {
-        _first_lidar_time = LidarMeasures.last_lio_update_time;
+        _first_lidar_time = LidarMeasures.last_lio_update_time; // 记录第一帧 LiDAR 的有效时间戳
+        // 将记录下的第一帧 LiDAR 时间戳传递给 IMU 处理模块（p_imu）
+        // IMU 预积分的边界对齐：IMU 的频率极高（通常 200Hz-500Hz），
+        // 在第一帧有效 LiDAR 点云到来之前，IMU 可能已经积累了大量的闲杂数据。
+        // 将这个时间戳传给 IMU 模块，可以告诉它：“系统正式从这里开始运作”。
         p_imu->first_lidar_time = _first_lidar_time; // Only for IMU data log
         is_first_frame = true;
         cout << "FIRST LIDAR FRAME!" << endl;

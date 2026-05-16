@@ -31,9 +31,8 @@ ImuProcess::ImuProcess()
     cur_pcl_un_.reset(new PointCloudXYZI());
 }
 
-void ImuProcess::setOutputDir(const std::string &dir)
-{
-  output_dir_ = dir;
+void ImuProcess::setOutputDir(const std::string &dir) {
+    output_dir_ = dir;
 }
 
 ImuProcess::~ImuProcess() {}
@@ -145,7 +144,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout,
     IMU_mean_acc_norm = mean_acc.norm();
     state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
     state_inout.rot_end =
-        Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+        Eye3d;                   // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
     state_inout.bias_g = Zero3d; // mean_gyr;
 
     last_imu = meas.imu.back();
@@ -578,21 +577,28 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
     // omp_get_wtime() - t1);
 }
 
+/**
+ * @brief IMU 预处理与点云去畸变模块
+ * 完成 IMU 的静止初始化，并在初始化完成后，
+ * 利用 IMU 的高频积分数据来预测当前状态，并消除激光雷达扫描期间因自身运动产生的点云畸变（Motion Deskew）。
+ * @param lidar_meas 一个同步好的数据包（Measurement Group）。它通常包含一帧激光雷达点云（或视觉图像），以及这段时间内对应的多个高频 IMU 测量值
+ * @param stat 系统的状态向量（State Vector），包含了位置、姿态、速度、IMU 零偏（Bias）、重力向量等。在此函数中，它将被 IMU 预积分更新为“预测状态（先验）”
+ * @param cur_pcl_un_ 去除运动畸变后的点云（Undistorted Point Cloud）
+ */
 void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
                           PointCloudXYZI::Ptr cur_pcl_un_) {
     double t1, t2, t3;
     t1 = omp_get_wtime(); // 记录当前时间，用于后续计算 IMU 处理模块的整体耗时
-    ROS_ASSERT(
-        lidar_meas.lidar !=
-        nullptr); // 断言检查：确保传入的测量数据包中，原始激光雷达点云指针不为空，否则直接报错终止程序。
+    // 断言检查：确保传入的测量数据包中，原始激光雷达点云指针不为空，否则直接报错终止程序。
+    ROS_ASSERT(lidar_meas.lidar != nullptr);
     if (!imu_en) {
         Forward_without_imu(lidar_meas, stat, *cur_pcl_un_);
         return;
     }
 
-    MeasureGroup meas =
-        lidar_meas.measures.back(); // 获取最新的一个测量组合包
-                                    // (包含当前处理时间段内的传感器数据)
+    // 获取最新的一个测量组合包
+    // (包含当前处理时间段内的传感器数据)
+    MeasureGroup meas = lidar_meas.measures.back();
 
     if (imu_need_init) {
         double pcl_end_time =
@@ -605,12 +611,13 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
             return;
         };
         /// The very first lidar frame
-        IMU_init(meas, stat, init_iter_num);
+        IMU_init(meas, stat, init_iter_num);  // 重力对齐与零偏估计
 
         imu_need_init = true;
 
         last_imu = meas.imu.back();
 
+        // 判断累积的帧数 init_iter_num 是否达到了配置的最大初始化帧数 MAX_INI_COUNT
         if (init_iter_num > MAX_INI_COUNT) {
             // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
             imu_need_init = false;
@@ -630,7 +637,7 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
 
         return;
     }
-
+    // IMU计算先验位姿与点云运动补偿
     UndistortPcl(lidar_meas, stat, *cur_pcl_un_);
     // cout << "[ IMU ] undistorted point num: " << cur_pcl_un_->size() << endl;
 }
