@@ -12,26 +12,38 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+
+/*
+ * 作用：FAST-LIVO2系统主控类（LIVMapper）的构造函数。
+ * 功能：完成系统运行前的各项内存分配、参数读取、核心处理模块（如LiDAR预处理、IMU处理、视觉VIO、体素地图等）的实例化，以及日志目录的初始化。
+ * 实现了什么：为LiDAR-Inertial-Visual（激光-惯性-视觉）紧耦合里程计准备好所有的初始状态、数据结构和依赖组件，打通ROS接口与底层核心算法。
+ * 怎么实现的：
+ * 1. 使用初始化列表和 `assign` 函数对传感器间的外参变量赋初值。
+ * 2. 通过 `std::shared_ptr::reset()` 为各个智能指针（如预处理模块、点云对象、VIO/VoxelMap管理器等）分配内存。
+ * 3. 调用内部函数（如 `readParameters`、`loadVoxelConfig`）从ROS节点加载YAML配置文件中的参数。
+ * 4. 生成带时间戳的日志文件夹，初始化文件输出流，配置系统输出路径。
+ */
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
 {
-    extrinT.assign(3, 0.0);
+    extrinT.assign(3, 0.0);     // IMU到LiDAR的外参
     extrinR.assign(9, 0.0);
-    cameraextrinT.assign(3, 0.0);
+    cameraextrinT.assign(3, 0.0);   // 相机到LiDAR的外参
     cameraextrinR.assign(9, 0.0);
 
-    p_pre.reset(new Preprocess());
-    p_imu.reset(new ImuProcess());
+    p_pre.reset(new Preprocess());  // 预处理类，负责处理最原始的LiDAR数据
+    p_imu.reset(new ImuProcess());  // IMU的预处理类
 
     readParameters(nh);
-    VoxelMapConfig voxel_config;
+    VoxelMapConfig voxel_config;    // 声明并加载体素地图（Voxel Map）的结构配置
     loadVoxelConfig(nh, voxel_config);
 
-    visual_sub_map.reset(new PointCloudXYZI());
-    feats_undistort.reset(new PointCloudXYZI());
-    feats_down_body.reset(new PointCloudXYZI());
-    feats_down_world.reset(new PointCloudXYZI());
+    // 点云内存结构分配
+    visual_sub_map.reset(new PointCloudXYZI());     // 视觉子图，用于 VIO 阶段局部视觉特征的跟踪
+    feats_undistort.reset(new PointCloudXYZI());    // 存放经过 IMU 去除运动畸变后的 LiDAR 点云
+    feats_down_body.reset(new PointCloudXYZI());    // 存放在 LiDAR 坐标系下（Body Frame）降采样后的点云
+    feats_down_world.reset(new PointCloudXYZI());   // 存放转换到世界坐标系下（World Frame）的降采样后的点云
     pcl_w_wait_pub.reset(new PointCloudXYZI());
     pcl_wait_pub.reset(new PointCloudXYZI());
     pcl_wait_save.reset(new PointCloudXYZRGB());
@@ -39,16 +51,22 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
     voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
     vio_manager.reset(new VIOManager());
     root_dir = ROOT_DIR;
-    initializeFiles();
-    initializeComponents();
-    path.header.stamp = ros::Time::now();
+    run_output_dir_ = createTimestampedDir(std::string(ROOT_DIR) + "Log");  // 获取系统运行的根目录，并在 Log 文件夹下自动创建一个以当前时间戳命名的新文件夹
+    ROS_INFO_STREAM("[LIVMapper] Run output directory: " << run_output_dir_);
+    initializeFiles();  // 会在这个目录里打开各种 .txt 文件，用于记录轨迹（poses）、预处理数据、时间消耗等，方便科研分析和 Debug
+    initializeComponents(); // 将前面第一步读取的外参等配置真正赋值给 voxelmap_manager 和 vio_manager 的内部变量
+    vio_manager->setOutputDir(run_output_dir_);
+    p_imu->setOutputDir(run_output_dir_);
+    path.header.stamp = ros::Time::now();   // nav_msgs::Path 类型的 ROS 消息，用于在 Rviz 中画出无人机/机器人的运动轨迹
     path.header.frame_id = "camera_init";
 }
 
 LIVMapper::~LIVMapper() {}
 
+// 读取FAST-LIVO2/config目录下的yaml配置文件中的参数配置，赋值给LIVOMapper节点句柄
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
+    // nh.param("param_name", variable, default_value)：读取参数，读不到就用默认值
     nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
     nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
@@ -170,34 +188,36 @@ void LIVMapper::initializeComponents()
 
 void LIVMapper::initializeFiles()
 {
-    if (pcd_save_en && colmap_output_en)
+    if (run_output_dir_.empty())
     {
-        const std::string folderPath = std::string(ROOT_DIR) + "/scripts/colmap_output.sh";
-
-        std::string chmodCommand = "chmod +x " + folderPath;
-
-        int chmodRet = system(chmodCommand.c_str());
-        if (chmodRet != 0)
-        {
-            std::cerr << "Failed to set execute permissions for the script." << std::endl;
-            return;
-        }
-
-        int executionRet = system(folderPath.c_str());
-        if (executionRet != 0)
-        {
-            std::cerr << "Failed to execute the script." << std::endl;
-            return;
-        }
+        run_output_dir_ = createTimestampedDir(std::string(ROOT_DIR) + "Log");
     }
+
     if (colmap_output_en)
-        fout_points.open(std::string(ROOT_DIR) + "Log/Colmap/sparse/0/points3D.txt", std::ios::out);
+    {
+        createDirectory(run_output_dir_ + "/Colmap/sparse/0");
+        fout_points.open(run_output_dir_ + "/Colmap/sparse/0/points3D.txt", std::ios::out);
+    }
     if (pcd_save_en)
-        fout_lidar_pos.open(std::string(ROOT_DIR) + "Log/pcd/lidar_poses.txt", std::ios::out);
+    {
+        createDirectory(run_output_dir_ + "/pcd");
+        fout_lidar_pos.open(run_output_dir_ + "/pcd/lidar_poses.txt", std::ios::out);
+        if (!fout_lidar_pos.is_open())
+            ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/pcd/lidar_poses.txt");
+    }
     if (img_save_en)
-        fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
-    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
-    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
+    {
+        createDirectory(run_output_dir_ + "/image");
+        fout_visual_pos.open(run_output_dir_ + "/image/image_poses.txt", std::ios::out);
+        if (!fout_visual_pos.is_open())
+            ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/image/image_poses.txt");
+    }
+    fout_pre.open(run_output_dir_ + "/mat_pre.txt", std::ios::out);
+    if (!fout_pre.is_open())
+        ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/mat_pre.txt");
+    fout_out.open(run_output_dir_ + "/mat_out.txt", std::ios::out);
+    if (!fout_out.is_open())
+        ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/mat_out.txt");
 }
 
 void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it)
@@ -403,14 +423,15 @@ void LIVMapper::handleLIO()
         std::ofstream outFile, evoFile;
         if (!pos_opend)
         {
-            evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
+            createDirectory(run_output_dir_ + "/result");
+            evoFile.open(run_output_dir_ + "/result/" + seq_name + ".txt", std::ios::out);
             pos_opend = true;
             if (!evoFile.is_open())
                 ROS_ERROR("open fail\n");
         }
         else
         {
-            evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::app);
+            evoFile.open(run_output_dir_ + "/result/" + seq_name + ".txt", std::ios::app);
             if (!evoFile.is_open())
                 ROS_ERROR("open fail\n");
         }
@@ -504,8 +525,9 @@ void LIVMapper::savePCD()
 {
     if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0)
     {
-        std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
-        std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+        createDirectory(run_output_dir_ + "/pcd");
+        std::string raw_points_dir = run_output_dir_ + "/pcd/all_raw_points.pcd";
+        std::string downsampled_points_dir = run_output_dir_ + "/pcd/all_downsampled_points.pcd";
         pcl::PCDWriter pcd_writer;
 
         if (img_en)
@@ -550,26 +572,88 @@ void LIVMapper::savePCD()
     }
 }
 
-void LIVMapper::run()
+bool LIVMapper::createDirectory(const std::string &path)
 {
+  struct stat st;
+  if (stat(path.c_str(), &st) == 0)
+  {
+    if (S_ISDIR(st.st_mode))
+      return true;
+    ROS_WARN_STREAM("[LIVMapper] " << path << " exists but is not a directory");
+    return false;
+  }
+
+  std::string cmd = "mkdir -p " + path;
+  int ret = system(cmd.c_str());
+  if (ret != 0)
+  {
+    ROS_WARN_STREAM("[LIVMapper] Failed to create directory: " << path);
+    return false;
+  }
+  return true;
+}
+
+std::string LIVMapper::createTimestampedDir(const std::string &base_dir)
+{
+  std::string dir = base_dir;
+  if (dir.empty()) dir = std::string(ROOT_DIR) + "Log";
+
+  size_t pos = 0;
+  while ((pos = dir.find_first_of('/', pos)) != std::string::npos)
+  {
+    std::string sub = dir.substr(0, pos);
+    if (!sub.empty()) createDirectory(sub);
+    pos++;
+  }
+  if (!dir.empty()) createDirectory(dir);
+
+  std::time_t now = std::time(nullptr);
+  std::tm *t = std::localtime(&now);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", t);
+  std::string timestamp(buf);
+
+  std::string run_dir = dir + "/" + timestamp;
+  createDirectory(run_dir);
+
+  return run_dir;
+}
+
+void LIVMapper::run() {
     ros::Rate rate(5000);
-    while (ros::ok())
-    {
+    int idle_count = 0;
+    while (ros::ok()) {
         ros::spinOnce();
-        if (!sync_packages(LidarMeasures))
-        {
+
+        if (!sync_packages(LidarMeasures)) {
+            if (has_started_)
+            {
+                if (imu_buffer.empty() && lid_raw_data_buffer.empty() && img_buffer.empty() &&
+                    LidarMeasures.measures.empty())
+                {
+                    idle_count++;
+                    if (idle_count > 50)
+                    {
+                        ROS_INFO("All data processed, shutting down...");
+                        break;
+                    }
+                }
+                else
+                {
+                    idle_count = 0;
+                }
+            }
             rate.sleep();
             continue;
         }
+        has_started_ = true;
+        idle_count = 0;
         handleFirstFrame();
-
         processImu();
-
-        // if (!p_imu->imu_time_init) continue;
-
         stateEstimationAndMapping();
     }
     savePCD();
+    ROS_INFO("FAST-LIVO2 finished and saved PCD.");
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -1236,7 +1320,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     {
         pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
     }
-    laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+    laserCloudmsg.header.stamp = ros::Time().fromSec(last_timestamp_lidar);
     laserCloudmsg.header.frame_id = "camera_init";
     pubLaserCloudFullRes.publish(laserCloudmsg);
 
@@ -1298,7 +1382,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
         }
         if ((pcl_wait_save->size() > 0 || pcl_wait_save_intensity->size() > 0) && pcd_save_interval > 0 && scan_wait_num >= pcd_save_interval)
         {
-            string all_points_dir(string(string(ROOT_DIR) + "Log/pcd/") + ss_time.str() + string(".pcd"));
+            string all_points_dir(run_output_dir_ + "/pcd/" + ss_time.str() + string(".pcd"));
 
             pcl::PCDWriter pcd_writer;
 
@@ -1331,7 +1415,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 
         if (img_save_interval > 0 && img_wait_num >= img_save_interval)
         {
-            imwrite(string(string(ROOT_DIR) + "Log/image/") + ss_time.str() + string(".png"), vio_manager->img_rgb);
+            imwrite(run_output_dir_ + "/image/" + ss_time.str() + string(".png"), vio_manager->img_rgb);
 
             Eigen::Quaterniond q(_state.rot_end);
             fout_visual_pos << std::fixed << std::setprecision(6);
@@ -1398,7 +1482,7 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "aft_mapped";
-    odomAftMapped.header.stamp = ros::Time::now(); //.ros::Time()fromSec(last_timestamp_lidar);
+    odomAftMapped.header.stamp = ros::Time().fromSec(last_timestamp_lidar);
     set_posestamp(odomAftMapped.pose.pose);
 
     static tf::TransformBroadcaster br;
@@ -1416,7 +1500,7 @@ void LIVMapper::publish_odometry(const ros::Publisher &pubOdomAftMapped)
 
 void LIVMapper::publish_mavros(const ros::Publisher &mavros_pose_publisher)
 {
-    msg_body_pose.header.stamp = ros::Time::now();
+    msg_body_pose.header.stamp = ros::Time().fromSec(last_timestamp_lidar);
     msg_body_pose.header.frame_id = "camera_init";
     set_posestamp(msg_body_pose.pose);
     mavros_pose_publisher.publish(msg_body_pose);

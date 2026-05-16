@@ -17,6 +17,11 @@ VIOManager::VIOManager()
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
 }
 
+void VIOManager::setOutputDir(const std::string &dir)
+{
+  output_dir_ = dir;
+}
+
 VIOManager::~VIOManager()
 {
   delete visual_submap;
@@ -128,11 +133,12 @@ void VIOManager::initializeVIO()
   if(colmap_output_en)
   {
     pinhole_cam = dynamic_cast<vk::PinholeCamera*>(cam);
-    fout_colmap.open(DEBUG_FILE_DIR("Colmap/sparse/0/images.txt"), ios::out);
+    string colmap_dir = output_dir_.empty() ? std::string(ROOT_DIR) + "Log/Colmap/sparse/0" : output_dir_ + "/Colmap/sparse/0";
+    fout_colmap.open(colmap_dir + "/images.txt", ios::out);
     fout_colmap << "# Image list with two lines of data per image:\n";
     fout_colmap << "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n";
     fout_colmap << "#   POINTS2D[] as (X, Y, POINT3D_ID)\n";
-    fout_camera.open(DEBUG_FILE_DIR("Colmap/sparse/0/cameras.txt"), ios::out);
+    fout_camera.open(colmap_dir + "/cameras.txt", ios::out);
     fout_camera << "# Camera list with one line of data per camera:\n";
     fout_camera << "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n";
     fout_camera << "1 PINHOLE " << width << " " << height << " "

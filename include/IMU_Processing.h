@@ -62,6 +62,8 @@ public:
     void disable_bias_est();
     void disable_exposure_est();
 
+    void setOutputDir(const std::string &dir);
+
     /**
      * 这是整个类的主干函数。每次拿到一个同步好的 LidarMeasureGroup（包含一帧雷达和一串 IMU），就会丢进这个函数。
      * 它内部会先检查 IMU 是否初始化，然后调用积分和去畸变逻辑。stat 是当前系统状态，cur_pcl_un_ 是用来存放处理完毕（Un-distorted）后干净点云的指针
@@ -75,6 +77,7 @@ public:
     void UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
 
     ofstream fout_imu;
+    string output_dir_;
     double IMU_mean_acc_norm;   // 记录一段时间内加速度的平均模长，用于判断是否处于静止状态
     V3D unbiased_gyr;   // 扣除零偏后的纯净角速度
 

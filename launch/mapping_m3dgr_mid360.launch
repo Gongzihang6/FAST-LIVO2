@@ -2,7 +2,7 @@
 <!-- Launch file for Livox AVIA LiDAR -->
     <node name="image_transport_1" pkg="image_transport" type="republish" args="compressed in:=/camera/color/image_raw raw out:=/camera/color/image_raw" />
 
-	<arg name="rviz" default="true" />
+	<arg name="rviz" default="false" />
 
 	<rosparam command="load" file="$(find fast_livo)/config/m3dgr_mid360.yaml" />
 

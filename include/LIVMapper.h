@@ -17,8 +17,10 @@ which is included as part of this source code package.
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
+#include <ctime>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <sys/stat.h>
 #include <vikit/camera_loader.h>
 
 class LIVMapper
@@ -53,6 +55,12 @@ public:
 
     // 调度激光雷达处理模块，将当前帧点云与局部地图进行匹配，构建点面距离残差
     void handleLIO();
+
+    // 工具函数：递归创建目录
+    bool createDirectory(const std::string &path);
+
+    // 工具函数：自动创建带时间戳的子文件夹，返回完整路径
+    std::string createTimestampedDir(const std::string &base_dir);
 
     // 将构建好的全局或局部 3D 点云地图保存为 .pcd 文件，供离线查看
     void savePCD();
@@ -112,6 +120,7 @@ public:
     std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;  // 全局统一体素地图，键是体素位置，值是指向体素八叉树节点的指针
 
     string root_dir;    // 日志保存的根目录
+    string run_output_dir_; // 本次运行带时间戳的输出子目录
     string lid_topic, imu_topic, seq_name, img_topic;   // 在 ROS 中订阅的传感器话题名称
     V3D extT;   // LiDAR 到 IMU 的外参 (平移和旋转)
     M3D extR;
@@ -129,6 +138,7 @@ public:
 
     // 系统运行状态标志 (Flags & States)
     bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
+    bool has_started_ = false;
     int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
     int pub_scan_num = 1;
 

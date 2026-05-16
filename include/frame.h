@@ -13,8 +13,17 @@ which is included as part of this source code package.
 #ifndef LIVO_FRAME_H_
 #define LIVO_FRAME_H_
 
+#include <list>
+#include <memory>
+#include <vector>
+#include <opencv2/opencv.hpp>
+#include <sophus/se3.h>
 #include <boost/noncopyable.hpp>
 #include <vikit/abstract_camera.h>
+
+using namespace std;
+using namespace Eigen;
+using namespace Sophus;
 
 class VisualPoint;
 struct Feature;

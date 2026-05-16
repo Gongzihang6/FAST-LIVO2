@@ -4,9 +4,12 @@ common:
   imu_topic: "/livox/mid360/imu"
   img_en: 1
   lidar_en: 1
+  # 用于修复某些非标准 ROS 驱动带来的时间戳异常或数据跳变问题
+  # 通常设为false
   ros_driver_bug_fix: false
 
 extrin_calib:
+  # LidarToIMU
   extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
   extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
   # LidarToCamera 
@@ -15,72 +18,83 @@ extrin_calib:
         0.850493,  0.060508,   0.522494] 
   Pcl: [-0.0442358, -0.411712, 0.168568]
 
+# IMU 和图像相对于 LiDAR 的固定时间差（单位：秒）。这通常用于硬件触发不同步时的软补偿
 time_offset: 
   imu_time_offset: 0.0
   img_time_offset: 0.1
+  # 相机曝光时间的初始估计值，用于精确对齐图像获取时刻与 LiDAR 扫描时刻
   exposure_time_init: 0.0
 
 preprocess:
-  point_filter_num: 1
-  filter_size_surf: 0.1
+  point_filter_num: 1 # 点云空间降采样间隔
+  filter_size_surf: 0.1 # 体素滤波器的叶子节点大小
   lidar_type: 1 # Livox Avia LiDAR
-  scan_line: 4
-  blind: 0.8
+  scan_line: 4  # lidar线束数量
+  blind: 0.8  # 距离雷达小于此数值的点会被视为车体遮挡或噪点，直接剔除
 
 vio:
-  max_iterations: 5
+  max_iterations: 5 # vio求解器中esikf的最大迭代次数
+  # 剔除异常视觉追踪点的光度误差阈值
   outlier_threshold: 1000 # 78 100 156 #100 200 500 700 infinite
-  img_point_cov: 100 # 100 1000 
-  patch_size: 8
-  patch_pyrimid_level: 4
-  normal_en: true
-  raycast_en: false
-  inverse_composition_en: false
-  exposure_estimate_en: true
-  inv_expo_cov: 0.1
+  img_point_cov: 100 # 100 1000  图像像素点的测量噪声协方差
+  patch_size: 8 # 直接法追踪使用的图像块（Patch）大小（设为 8，即 8x8 像素块）
+  patch_pyrimid_level: 4  # 图像金字塔层数
+  normal_en: true # 是否启用面片法向量估计。启用后能处理视角变化带来的仿射畸变
+  raycast_en: false # 射线检测开关，用于判断 3D 点云是否被其他物体遮挡，避免将背景点投影到前景上
+  inverse_composition_en: false # 是否使用反向组合（Inverse Compositional）算法加速 Lucas-Kanade 光流/直接法的计算
+  exposure_estimate_en: true  # 是否开启曝光时间估计
+  inv_expo_cov: 0.1 # 曝光时间估计值的协方差
 
 imu:
   imu_en: true
-  imu_int_frame: 30
+  imu_int_frame: 30 # IMU 初始化的数据帧数（静止初始化阶段）
   acc_cov: 0.5 # 0.2
   gyr_cov: 0.3 # 0.5
   b_acc_cov: 0.0001 # 0.1
   b_gyr_cov: 0.0001 # 0.1
 
 lio:
-  max_iterations: 5
-  dept_err: 0.02
-  beam_err: 0.05
-  min_eigen_value: 0.0025 # 0.005
-  voxel_size: 0.5
-  max_layer: 2
+  max_iterations: 5 # lio进行ESIKF的最大迭代次数
+  dept_err: 0.02  # 深度误差
+  beam_err: 0.05  # 光束发散角误差
+  min_eigen_value: 0.0025 # 0.005 最小特征值阈值。用于检测点面 ICP 优化中是否发生了几何退化（如在长直走廊中缺乏约束）
+  voxel_size: 0.5 # ikd-Tree 或增量体素地图的叶子尺寸
+  # # 控制体素地图 / 八叉树的内存结构。最大层数、每个体素最大点数，以及各层初始预分配的容量，用于优化内存读取速度
+  max_layer: 2  
   max_points_num: 50
   layer_init_num: [5, 5, 5, 5, 5]
 
 local_map:  
-  map_sliding_en: false
-  half_map_size: 100
-  sliding_thresh: 8
+  map_sliding_en: false # 是否启用滑动窗口地图
+  half_map_size: 100  # 局部地图的半边长范围
+  sliding_thresh: 8 # 触发地图滑动的移动距离阈值
 
 uav:
-  imu_rate_odom: false
-  gravity_align_en: false
+  imu_rate_odom: false  # 是否以 IMU 的高频率发布里程计位姿（对无人机飞控非常重要）
+  gravity_align_en: false # 重力对齐开关。开启后，系统在初始化时会将 Z 轴对齐到重力方向
 
 publish:
-  dense_map_en: true
-  pub_effect_point_en: false 
-  pub_plane_en: false
-  pub_scan_num: 1
-  blind_rgb_points: 0.0
+  dense_map_en: false  # 是否发布稠密点云地图（关闭则发布降采样后的点云，节省 Rviz 渲染性能）
+  pub_effect_point_en: false # 是否发布在当前优化中实际起到约束作用（Effective）的特征点
+  pub_plane_en: false # 是否在 Rviz 中发布拟合出来的平面可视化 Marker
+  pub_scan_num: 1 # 积攒多少帧扫描结果后发布一次点云
+  blind_rgb_points: 0.0 # 着色盲区。距离小于该值的 3D 点云不会去相机图像中获取 RGB 颜色
 
 evo:
-  seq_name: "CBD_Building_01"
-  pose_output_en: false
+  # seq_name: "CBD_Building_01"
+  pose_output_en: true  # 是否将最终估计的位姿输出为 .txt 文件，用于后续使用 EVO评估
 
+image_save:
+  img_save_en: false
+  interval: 1
+  
 pcd_save:
   pcd_save_en: false
+  # 是否将输出数据转为 COLMAP（多视图三维重建软件）兼容的格式
   colmap_output_en: false # need to set interval = -1
-  filter_size_pcd: 0.15
+  filter_size_pcd: 0.15 # 存盘前点云的降采样体素大小
   interval: -1
+  # -1 代表在程序结束时将所有帧合并保存成一个整体的 PCD 文件。如果环境过大，设为 -1 可能会导致内存溢出；
+  # 如果设为正整数，则代表每隔几帧保存一个独立的局部 PCD 文件。
   # how many LiDAR frames saved in each pcd file;
   # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
