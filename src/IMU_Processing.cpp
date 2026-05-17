@@ -244,13 +244,15 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas,
 void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
                               StatesGroup &state_inout,
                               PointCloudXYZI &pcl_out) {
-    double t0 = omp_get_wtime();
-    pcl_out.clear();
+    double t0 = omp_get_wtime(); // 记录起始时间用于性能测试
+    pcl_out.clear();    // 清空指针脏数据
     /*** add the imu of the last frame-tail to the of current frame-head ***/
+    // IMU 积分必须是连续的。由于时间戳对齐的问题，当前 LiDAR 帧的起始时间不一定正好踩在一个 IMU 数据点上。
+    // 引入上一帧的最后一个 IMU 数据，可以用来做时间插值。
     MeasureGroup &meas = lidar_meas.measures.back();
     // cout<<"meas.imu.size: "<<meas.imu.size()<<endl;
     auto v_imu = meas.imu;
-    v_imu.push_front(last_imu);
+    v_imu.push_front(last_imu); // 将上一次最后一条 IMU 数据塞入当前队列头部，保证积分的连续性
     const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
     const double &imu_end_time = v_imu.back()->header.stamp.toSec();
     const double prop_beg_time = last_prop_end_time;
@@ -259,8 +261,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
     // sequence size: %zu \n", meas.imu.size()); printf("[ IMU ]
     // lidar_scan_index_now: %d \n", lidar_meas.lidar_scan_index_now);
 
-    const double prop_end_time =
-        lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
+    // 确定这一帧预积分的终点时间
+    const double prop_end_time = meas.event_time > 0.0
+                                     ? meas.event_time
+                                     : (lidar_meas.lio_vio_flg == LIO || lidar_meas.lio_vio_flg == LO ? meas.lio_time : meas.vio_time);
 
     /*** cut lidar point based on the propagation-start time and required
      * propagation-end time ***/
@@ -284,10 +288,17 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
 
     // printf("[ IMU ] last propagation end time: %lf \n",
     // lidar_meas.last_lio_update_time);
+
+    // lidar_meas.pcl_proc_cur 存放的是从底层的 ROS 回调函数传上来的、带有运动扭曲的原始点云
+    // pcl_wait_proc 是一个类成员变量，充当“待处理加工厂”。
+    // 代码先给它分配好对应的内存大小（resize），然后把原始点云全部复制进来。
+    // 后续的反向传播去畸变（Deskewing）就会直接在这个 pcl_wait_proc 里面把被扭曲的点一个个“掰正” 
     if (lidar_meas.lio_vio_flg == LIO) {
         pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->points.size());
         pcl_wait_proc = *(lidar_meas.pcl_proc_cur);
-        lidar_meas.lidar_scan_index_now = 0;
+        lidar_meas.lidar_scan_index_now = 0; // 将当前激光扫描的处理索引归零
+        // acc_s_last, angvel_last：当前的加速度和角速度
+        // state_inout.vel_end, pos_end, rot_end：当前系统卡尔曼滤波器里的速度、位置和姿态（即上一帧结束时的最优估计值）
         IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last,
                                      state_inout.vel_end, state_inout.pos_end,
                                      state_inout.rot_end));
@@ -308,16 +319,18 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
     // IMUpose.clear();
 
     /*** forward propagation at each imu point ***/
+    // vel_imu, pos_imu, R_imu：当前循环的初始速度、位置和旋转（姿态），它们直接取自系统当前的最优状态估计 state_inout
     V3D acc_imu(acc_s_last), angvel_avr(angvel_last), acc_avr,
         vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
     // cout << "[ IMU ] input state: " << state_inout.vel_end.transpose() << " "
     // << state_inout.pos_end.transpose() << endl;
     M3D R_imu(state_inout.rot_end);
-    MD(DIM_STATE, DIM_STATE)
-    F_x, cov_w;
+    MD(DIM_STATE, DIM_STATE) F_x, cov_w; // F_x 是误差状态转移矩阵的雅可比，cov_w 是系统噪声协方差
     double dt, dt_all = 0.0;
     double offs_t;
     // double imu_time;
+
+    // 相机曝光时间（光度参数）的初始化
     double tau;
     if (!imu_time_init) {
         // imu_time = v_imu.front()->header.stamp.toSec() - first_lidar_time;
@@ -335,11 +348,15 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
     switch (lidar_meas.lio_vio_flg) {
     case LIO:
     case VIO:
+    case WHEEL:
+    case GNSS:
         dt = 0;
         for (int i = 0; i < v_imu.size() - 1; i++) {
-            auto head = v_imu[i];
+            auto head = v_imu[i];   // head 代表当前 IMU 数据，tail 代表下一个 IMU 数据
             auto tail = v_imu[i + 1];
 
+            // 跳过那些比积分起始时间（prop_beg_time）还要早的无效旧数据，防止重复积分
+            // 找到head和tail刚好包含prop_beg_time的时刻
             if (tail->header.stamp.toSec() < prop_beg_time)
                 continue;
 
@@ -377,7 +394,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
                 // printf("00 \n");
                 dt = tail->header.stamp.toSec() - last_prop_end_time;
                 offs_t = tail->header.stamp.toSec() - prop_beg_time;
-            } else if (i != v_imu.size() - 2) {
+            } else if (i != v_imu.size() - 2) { // 
                 // printf("11 \n");
                 dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
                 offs_t = tail->header.stamp.toSec() - prop_beg_time;
@@ -601,10 +618,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat,
     MeasureGroup meas = lidar_meas.measures.back();
 
     if (imu_need_init) {
-        double pcl_end_time =
-            lidar_meas.lio_vio_flg == LIO
-                ? meas.lio_time
-                : meas.vio_time; // 时间戳取决于当前是处理激光帧还是视觉帧
+        double pcl_end_time = meas.event_time > 0.0
+                                  ? meas.event_time
+                                  : (lidar_meas.lio_vio_flg == LIO || lidar_meas.lio_vio_flg == LO ? meas.lio_time : meas.vio_time);
         // lidar_meas.last_lio_update_time = pcl_end_time;
 
         if (meas.imu.empty()) {

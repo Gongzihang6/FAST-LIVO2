@@ -31,6 +31,9 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
     extrinR.assign(9, 0.0);
     cameraextrinT.assign(3, 0.0);   // 相机到LiDAR的外参
     cameraextrinR.assign(9, 0.0);
+    gnssExtrinT.assign(3, 0.0);
+    wheelExtrinT.assign(3, 0.0);
+    wheelExtrinR.assign(9, 0.0);
 
     p_pre.reset(new Preprocess());  // 预处理类，负责处理最原始的LiDAR数据
     p_imu.reset(new ImuProcess());  // IMU的预处理类
@@ -69,6 +72,8 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
     // nh.param("param_name", variable, default_value)：读取参数，读不到就用默认值
     nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
+    nh.param<string>("gnss/topic", gnss_topic, "/mavros/global_position/raw/fix");
+    nh.param<string>("wheel/topic", wheel_topic, "/odom");
     nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
     nh.param<int>("common/img_en", img_en, 1);
     nh.param<int>("common/lidar_en", lidar_en, 1);
@@ -91,8 +96,34 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
     nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
     nh.param<double>("time_offset/imu_time_offset", imu_time_offset, 0.0);
     nh.param<double>("time_offset/lidar_time_offset", lidar_time_offset, 0.0);
+    nh.param<double>("time_offset/gnss_time_offset", gnss_time_offset, 0.0);
+    nh.param<double>("time_offset/wheel_time_offset", wheel_time_offset, 0.0);
     nh.param<bool>("uav/imu_rate_odom", imu_prop_enable, false);
     nh.param<bool>("uav/gravity_align_en", gravity_align_en, false);
+
+    nh.param<bool>("gnss/enable", gnss_en, false);
+    nh.param<bool>("gnss/use_msg_cov", gnss_use_msg_cov, true);
+    nh.param<bool>("gnss/use_z", gnss_use_z, true);
+    nh.param<std::string>("gnss/update_mode", gnss_update_mode_, std::string("full"));
+    nh.param<double>("gnss/default_cov_xy", gnss_default_cov_xy, 25.0);
+    nh.param<double>("gnss/default_cov_z", gnss_default_cov_z, 64.0);
+    nh.param<double>("gnss/gate", gnss_gate, 16.0);
+    nh.param<int>("gnss/align_min_samples", gnss_align_min_samples_, 15);
+    nh.param<int>("gnss/realign_interval", gnss_realign_interval_, 50);
+    nh.param<int>("gnss/align_window_size", gnss_align_window_size_, 200);
+    nh.param<bool>("gnss/fallback_z_only", gnss_fallback_z_only_, true);
+    nh.param<vector<double>>("gnss/extrinsic_T", gnssExtrinT, vector<double>());
+
+    nh.param<bool>("wheel/enable", wheel_en, false);
+    nh.param<bool>("wheel/use_nhc", wheel_use_nhc, true);
+    nh.param<bool>("wheel/use_pose_delta", wheel_use_pose_delta_, true);
+    nh.param<double>("wheel/forward_cov", wheel_forward_cov, 0.5);
+    nh.param<double>("wheel/lateral_cov", wheel_lateral_cov, 0.2);
+    nh.param<double>("wheel/gate", wheel_gate, 9.0);
+    nh.param<double>("wheel/pose_cov_pos", wheel_pose_cov_pos, 0.2);
+    nh.param<double>("wheel/pose_cov_rot", wheel_pose_cov_rot, 0.05);
+    nh.param<vector<double>>("wheel/extrinsic_T", wheelExtrinT, vector<double>());
+    nh.param<vector<double>>("wheel/extrinsic_R", wheelExtrinR, vector<double>());
 
     nh.param<string>("evo/seq_name", seq_name, "01");
     nh.param<bool>("evo/pose_output_en", pose_output_en, false);
@@ -139,6 +170,12 @@ void LIVMapper::initializeComponents()
     downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
     extT << VEC_FROM_ARRAY(extrinT);
     extR << MAT_FROM_ARRAY(extrinR);
+    if (gnssExtrinT.size() == 3)
+        gnss_pos_in_imu << VEC_FROM_ARRAY(gnssExtrinT);
+    if (wheelExtrinT.size() == 3)
+        wheel_pos_in_imu << VEC_FROM_ARRAY(wheelExtrinT);
+    if (wheelExtrinR.size() == 9)
+        wheel_rot_in_imu << MAT_FROM_ARRAY(wheelExtrinR);
 
     voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
     voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
@@ -218,6 +255,10 @@ void LIVMapper::initializeFiles()
     fout_out.open(run_output_dir_ + "/mat_out.txt", std::ios::out);
     if (!fout_out.is_open())
         ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/mat_out.txt");
+    fout_runtime_log_.open(run_output_dir_ + "/runtime_terminal.log", std::ios::out);
+    if (!fout_runtime_log_.is_open())
+        ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/runtime_terminal.log");
+    RuntimeLogger::init(run_output_dir_ + "/runtime_terminal.log");
 }
 
 /*
@@ -236,6 +277,10 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
     sub_pcl = p_pre->lidar_type == AVIA ? nh.subscribe(lid_topic, 200000, &LIVMapper::livox_pcl_cbk, this) : nh.subscribe(lid_topic, 200000, &LIVMapper::standard_pcl_cbk, this);
     sub_imu = nh.subscribe(imu_topic, 200000, &LIVMapper::imu_cbk, this);
     sub_img = nh.subscribe(img_topic, 200000, &LIVMapper::img_cbk, this);
+    if (gnss_en)
+        sub_gnss = nh.subscribe(gnss_topic, 200000, &LIVMapper::gnss_cbk, this);
+    if (wheel_en)
+        sub_wheel = nh.subscribe(wheel_topic, 200000, &LIVMapper::wheel_cbk, this);
 
     // 发布去畸变、配准到世界坐标系下的当前帧完整点云，Rviz中看到的
     pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100);
@@ -342,6 +387,12 @@ void LIVMapper::stateEstimationAndMapping()
 {
     switch (LidarMeasures.lio_vio_flg)
     {
+    case WHEEL:
+        handleWheel();
+        break;
+    case GNSS:
+        handleGNSS();
+        break;
     case VIO:
         handleVIO();
         break;
@@ -349,6 +400,495 @@ void LIVMapper::stateEstimationAndMapping()
     case LO:
         handleLIO();
         break;
+    }
+}
+
+void LIVMapper::applyStateCorrection(const Eigen::Matrix<double, DIM_STATE, 1> &dx)
+{
+    _state += dx;
+    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());
+}
+
+/*
+ * 作用：通用的 ESIKF 顺序测量更新（Sequential Measurement Update）接口。
+ * 功能：接收任意外部传感器（如 GNSS、轮速计、视觉或额外的 LiDAR 特征）的残差与雅可比矩阵，对当前卡尔曼滤波器的状态进行状态修正，并在更新前执行异常值剔除（Outlier Rejection）。
+ * 实现了什么：实现了一个标准且安全的卡尔曼更新前置检验流程。它拦截了那些由于传感器故障、多径效应或动态障碍物产生的“离谱”观测数据，保护了系统状态免受破坏。
+ * 怎么实现的：
+ * 1. 检查输入矩阵维度是否合法。
+ * 2. 计算新息协方差矩阵（Innovation Covariance, S）。
+ * 3. 利用 LDLT 分解判断 S 矩阵的正定性，确保数值计算稳定。
+ * 4. 计算观测残差的马氏距离（Mahalanobis Distance），并与设定的卡方检验阈值（mahalanobis_gate）对比，超过阈值则拒绝更新。
+ */
+bool LIVMapper::sequentialMeasurementUpdate(const Eigen::MatrixXd &H,
+                                            const Eigen::VectorXd &residual,
+                                            const Eigen::MatrixXd &noise,
+                                            double mahalanobis_gate,
+                                            const std::string &tag)
+{
+    if (H.rows() == 0 || H.rows() != residual.rows() || noise.rows() != noise.cols() || noise.rows() != H.rows())
+        return false;
+
+    // innovation 是卡尔曼滤波中著名的新息协方差矩阵 $S$，公式为：$S = H P H ^ T + R$ 
+    const Eigen::Matrix<double, DIM_STATE, DIM_STATE> prior_cov = _state.cov;
+    const Eigen::MatrixXd innovation = H * prior_cov * H.transpose() + noise;
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(innovation);
+    if (ldlt.info() != Eigen::Success)
+    {
+        std::ostringstream oss;
+        oss << "[ " << tag << " ] innovation matrix is not positive definite, skip update.\n";
+        ROS_WARN_STREAM(oss.str());
+        logRuntimeMessage(oss.str());
+        return false;
+    }
+    // 计算当前观测残差的平方马氏距离,实现了数学公式：$D_m^2 = z^T S^{-1} z$ （其中 $z$ 就是 residual）
+    const double mahalanobis = residual.transpose() * ldlt.solve(residual);
+    if (mahalanobis_gate > 0.0 && mahalanobis > mahalanobis_gate)
+    {
+        std::ostringstream oss;
+        oss << "[ " << tag << " ] reject measurement by gate, mahalanobis = " << mahalanobis << ", residual_norm = " << residual.norm() << "\n";
+        ROS_WARN_STREAM(oss.str());
+        logRuntimeMessage(oss.str());
+        return false;
+    }
+
+    const Eigen::MatrixXd K = prior_cov * H.transpose() * ldlt.solve(Eigen::MatrixXd::Identity(H.rows(), H.rows()));
+    Eigen::Matrix<double, DIM_STATE, 1> dx = K * residual;
+    applyStateCorrection(dx);
+
+    const Eigen::Matrix<double, DIM_STATE, DIM_STATE> I = Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Identity();
+    const Eigen::Matrix<double, DIM_STATE, DIM_STATE> KH = K * H;
+    _state.cov = (I - KH) * prior_cov * (I - KH).transpose() + K * noise * K.transpose();
+    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());
+
+    state_propagat = _state;
+    voxelmap_manager->state_ = _state;
+    return true;
+}
+
+Eigen::Vector3d LIVMapper::llaToEnu(double latitude, double longitude, double altitude) const
+{
+    constexpr double kA = 6378137.0;
+    constexpr double kE2 = 6.69437999014e-3;
+    const double lat = latitude * M_PI / 180.0;
+    const double lon = longitude * M_PI / 180.0;
+    const double lat0 = gnss_origin_lla.x() * M_PI / 180.0;
+    const double lon0 = gnss_origin_lla.y() * M_PI / 180.0;
+
+    auto llaToEcef = [&](double lat_rad, double lon_rad, double alt_m) {
+        const double sin_lat = std::sin(lat_rad);
+        const double cos_lat = std::cos(lat_rad);
+        const double sin_lon = std::sin(lon_rad);
+        const double cos_lon = std::cos(lon_rad);
+        const double N = kA / std::sqrt(1.0 - kE2 * sin_lat * sin_lat);
+        Eigen::Vector3d ecef;
+        ecef.x() = (N + alt_m) * cos_lat * cos_lon;
+        ecef.y() = (N + alt_m) * cos_lat * sin_lon;
+        ecef.z() = (N * (1.0 - kE2) + alt_m) * sin_lat;
+        return ecef;
+    };
+
+    const Eigen::Vector3d ecef = llaToEcef(lat, lon, altitude);
+    const Eigen::Vector3d origin_ecef = llaToEcef(lat0, lon0, gnss_origin_lla.z());
+    const Eigen::Vector3d delta = ecef - origin_ecef;
+
+    Eigen::Matrix3d ecef_to_enu;
+    ecef_to_enu << -std::sin(lon0), std::cos(lon0), 0.0,
+        -std::sin(lat0) * std::cos(lon0), -std::sin(lat0) * std::sin(lon0), std::cos(lat0),
+        std::cos(lat0) * std::cos(lon0), std::cos(lat0) * std::sin(lon0), std::sin(lat0);
+    return ecef_to_enu * delta;
+}
+
+void LIVMapper::logRuntimeMessage(const std::string &message) const
+{
+    RuntimeLogger::log(message);
+}
+
+bool LIVMapper::estimateGnssAlignment(bool force_reestimate)
+{
+    if (static_cast<int>(gnss_align_enu_samples_.size()) < gnss_align_min_samples_)
+        return gnss_align_estimated_;
+
+    const int n = static_cast<int>(gnss_align_enu_samples_.size());
+    // 检查是否有足够的运动距离来估计航向角
+    const double motion_dist = (gnss_align_enu_samples_.back().head<2>() - gnss_align_enu_samples_.front().head<2>()).norm();
+    if (motion_dist < 5.0 && !force_reestimate && !gnss_align_estimated_)
+    {
+        return false; // 等待足够的运动距离
+    }
+
+    Eigen::MatrixXd enu_xy(2, n), world_xy(2, n);
+    double mean_enu_z = 0.0, mean_world_z = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        enu_xy.col(i) = gnss_align_enu_samples_[i].head<2>();
+        world_xy.col(i) = gnss_align_world_samples_[i].head<2>();
+        mean_enu_z += gnss_align_enu_samples_[i].z();
+        mean_world_z += gnss_align_world_samples_[i].z();
+    }
+    mean_enu_z /= n;
+    mean_world_z /= n;
+
+    const Eigen::Vector2d enu_mean = enu_xy.rowwise().mean();
+    const Eigen::Vector2d world_mean = world_xy.rowwise().mean();
+    Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+    for (int i = 0; i < n; ++i)
+        covariance += (enu_xy.col(i) - enu_mean) * (world_xy.col(i) - world_mean).transpose();
+
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(covariance, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix2d R2 = svd.matrixV() * svd.matrixU().transpose();
+    if (R2.determinant() < 0.0)
+    {
+        Eigen::Matrix2d V = svd.matrixV();
+        V.col(1) *= -1.0;
+        R2 = V * svd.matrixU().transpose();
+    }
+
+    gnss_align_rot_.setIdentity();
+    gnss_align_rot_.block<2, 2>(0, 0) = R2;
+    gnss_align_trans_.head<2>() = world_mean - R2 * enu_mean;
+    gnss_align_trans_.z() = mean_world_z - mean_enu_z;
+    const bool first_init = !gnss_align_estimated_;
+    gnss_align_estimated_ = true;
+    gnss_events_since_realign_ = 0;
+
+    std::ostringstream oss;
+    oss << "[ GNSS ] alignment " << (first_init && !force_reestimate ? "initialized" : "re-estimated")
+        << " with " << n << " samples, yaw(deg)="
+        << std::atan2(R2(1, 0), R2(0, 0)) * 57.295779513 << ", trans="
+        << gnss_align_trans_.transpose() << "\n";
+    ROS_INFO_STREAM(oss.str());
+    logRuntimeMessage(oss.str());
+    return true;
+}
+
+Eigen::Vector3d LIVMapper::transformGnssToWorld(const Eigen::Vector3d &enu) const
+{
+    return gnss_align_rot_ * enu + gnss_align_trans_;
+}
+
+bool LIVMapper::buildAuxiliaryEvent(MeasureGroup &measure, double event_time)
+{
+    if (imu_en && last_timestamp_imu < event_time)
+        return false;
+
+    measure.event_time = event_time;
+    measure.lio_time = event_time;
+    measure.vio_time = event_time;
+    measure.imu.clear();
+
+    mtx_buffer.lock();
+    while (!imu_buffer.empty())
+    {
+        const double imu_time = imu_buffer.front()->header.stamp.toSec();
+        if (imu_time > event_time)
+            break;
+        if (imu_time > LidarMeasures.last_lio_update_time)
+            measure.imu.push_back(imu_buffer.front());
+        imu_buffer.pop_front();
+    }
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    return true;
+}
+
+bool LIVMapper::prepareWheelEvent(LidarMeasureGroup &meas, double event_time)
+{
+    if (!wheel_en || wheel_buffer.empty())
+        return false;
+
+    MeasureGroup m;
+    if (!buildAuxiliaryEvent(m, event_time))
+        return false;
+
+    m.has_wheel = true;
+    m.wheel = wheel_buffer.front();
+    wheel_buffer.pop_front();
+    meas.measures.clear();
+    meas.measures.push_back(m);
+    meas.lio_vio_flg = WHEEL;
+    return true;
+}
+
+bool LIVMapper::prepareGNSSEvent(LidarMeasureGroup &meas, double event_time)
+{
+    if (!gnss_en || gnss_buffer.empty())
+        return false;
+
+    MeasureGroup m;
+    if (!buildAuxiliaryEvent(m, event_time))
+        return false;
+
+    m.has_gnss = true;
+    m.gnss = gnss_buffer.front();
+    gnss_buffer.pop_front();
+    meas.measures.clear();
+    meas.measures.push_back(m);
+    meas.lio_vio_flg = GNSS;
+    return true;
+}
+
+double LIVMapper::nextWheelTime() const
+{
+    return (wheel_en && !wheel_buffer.empty()) ? wheel_buffer.front().timestamp : 1e18;
+}
+
+double LIVMapper::nextGNSSTime() const
+{
+    return (gnss_en && !gnss_buffer.empty()) ? gnss_buffer.front().timestamp : 1e18;
+}
+
+void LIVMapper::dropStaleAuxiliaryMeasurements(double reference_time)
+{
+    while (!wheel_buffer.empty() && wheel_buffer.front().timestamp <= reference_time + 1e-6)
+        wheel_buffer.pop_front();
+    while (!gnss_buffer.empty() && gnss_buffer.front().timestamp <= reference_time + 1e-6)
+        gnss_buffer.pop_front();
+}
+
+void LIVMapper::handleWheel()
+{
+    if (LidarMeasures.measures.empty() || !LidarMeasures.measures.back().has_wheel)
+        return;
+
+    const WheelData &wheel = LidarMeasures.measures.back().wheel;
+    bool updated = false;
+    double residual_norm = 0.0;
+
+    if (wheel_use_pose_delta_ && wheel.has_pose && last_wheel_state_valid_ && last_wheel_data_.has_pose)
+    {
+        Eigen::Isometry3d T_w_prev = Eigen::Isometry3d::Identity();
+        T_w_prev.linear() = last_wheel_data_.orientation.toRotationMatrix();
+        T_w_prev.translation() = last_wheel_data_.position;
+        Eigen::Isometry3d T_w_curr = Eigen::Isometry3d::Identity();
+        T_w_curr.linear() = wheel.orientation.toRotationMatrix();
+        T_w_curr.translation() = wheel.position;
+        const Eigen::Isometry3d T_w_delta = T_w_prev.inverse() * T_w_curr;
+
+        Eigen::Isometry3d T_i_wheel = Eigen::Isometry3d::Identity();
+        T_i_wheel.linear() = wheel_rot_in_imu.transpose();
+        T_i_wheel.translation() = wheel_pos_in_imu;
+        const Eigen::Isometry3d T_wheel_i = T_i_wheel.inverse();
+        const Eigen::Isometry3d T_i_delta_meas = T_i_wheel * T_w_delta * T_wheel_i;
+
+        const M3D R_prev = last_wheel_state_.rot_end;
+        const V3D p_prev = last_wheel_state_.pos_end;
+        const M3D R_pred = R_prev.transpose() * _state.rot_end;
+        const V3D t_pred = R_prev.transpose() * (_state.pos_end - p_prev);
+
+        Eigen::Matrix<double, 6, 1> residual_pose = Eigen::Matrix<double, 6, 1>::Zero();
+        const M3D R_residual = R_pred.transpose() * T_i_delta_meas.rotation();
+        residual_pose.block<3, 1>(0, 0) = Log(R_residual);
+        residual_pose.block<3, 1>(3, 0) = T_i_delta_meas.translation() - t_pred;
+        residual_norm = residual_pose.norm();
+
+        Eigen::Matrix<double, 6, DIM_STATE> H_pose = Eigen::Matrix<double, 6, DIM_STATE>::Zero();
+        H_pose.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+        H_pose.block<3, 3>(3, 3) = R_prev.transpose();
+
+        Eigen::Matrix<double, 6, 6> noise_pose = Eigen::Matrix<double, 6, 6>::Zero();
+        noise_pose.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * std::max(1e-4, wheel_pose_cov_rot);
+        noise_pose.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * std::max(1e-4, wheel_pose_cov_pos);
+        updated = sequentialMeasurementUpdate(H_pose, residual_pose, noise_pose, wheel_gate, "WheelPose");
+    }
+
+    if (!updated)
+    {
+        const V3D vel_imu = _state.rot_end.transpose() * _state.vel_end;
+        V3D omega_imu = V3D::Zero();
+        if (!LidarMeasures.measures.back().imu.empty())
+        {
+            const auto &imu_msg = LidarMeasures.measures.back().imu.back();
+            omega_imu << imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z;
+            omega_imu -= _state.bias_g;
+        }
+        const V3D vel_at_wheel_in_imu = vel_imu + omega_imu.cross(wheel_pos_in_imu);
+        const V3D vel_wheel = wheel_rot_in_imu * vel_at_wheel_in_imu;
+
+        Eigen::Vector2d residual;
+        residual << wheel.linear_velocity.x() - vel_wheel.x(), -vel_wheel.y();
+        residual_norm = residual.norm();
+
+        Eigen::Matrix<double, 2, DIM_STATE> H = Eigen::Matrix<double, 2, DIM_STATE>::Zero();
+        M3D vel_at_wheel_hat;
+        vel_at_wheel_hat << SKEW_SYM_MATRX(vel_at_wheel_in_imu);
+        H.block<2, 3>(0, 0) = (wheel_rot_in_imu * (-vel_at_wheel_hat)).topRows<2>();
+        H.block<2, 3>(0, 7) = (wheel_rot_in_imu * _state.rot_end.transpose()).topRows<2>();
+
+        Eigen::Matrix2d noise = Eigen::Matrix2d::Zero();
+        noise(0, 0) = std::max(1e-4, wheel_forward_cov);
+        noise(1, 1) = std::max(1e-4, wheel_use_nhc ? wheel_lateral_cov : 1e6);
+        updated = sequentialMeasurementUpdate(H, residual, noise, wheel_gate, "WheelVel");
+    }
+
+    if (updated)
+    {
+        wheel_accept_count_++;
+        wheel_residual_accum_ += residual_norm;
+        ekf_finish_once = true;
+        if (imu_prop_enable)
+        {
+            latest_ekf_state = _state;
+            latest_ekf_time = LidarMeasures.last_lio_update_time;
+            state_update_flg = true;
+        }
+    }
+    else
+    {
+        wheel_reject_count_++;
+    }
+
+    last_wheel_data_ = wheel;
+    last_wheel_state_ = _state;
+    last_wheel_state_valid_ = true;
+
+    if ((wheel_accept_count_ + wheel_reject_count_) % 100 == 0)
+    {
+        std::ostringstream oss;
+        const size_t total = wheel_accept_count_ + wheel_reject_count_;
+        const double mean_res = wheel_accept_count_ > 0 ? wheel_residual_accum_ / wheel_accept_count_ : 0.0;
+        oss << "[ Wheel ] accept=" << wheel_accept_count_ << ", reject=" << wheel_reject_count_
+            << ", mean_residual=" << mean_res << "\n";
+        logRuntimeMessage(oss.str());
+    }
+}
+
+void LIVMapper::handleGNSS()
+{
+    if (LidarMeasures.measures.empty() || !LidarMeasures.measures.back().has_gnss)
+        return;
+
+    GNSSData &gnss = LidarMeasures.measures.back().gnss;
+    gnss_align_enu_samples_.push_back(gnss.enu);
+    gnss_align_world_samples_.push_back(_state.pos_end);
+    if (static_cast<int>(gnss_align_enu_samples_.size()) > gnss_align_window_size_)
+    {
+        gnss_align_enu_samples_.erase(gnss_align_enu_samples_.begin());
+        gnss_align_world_samples_.erase(gnss_align_world_samples_.begin());
+    }
+
+    if (!gnss_align_estimated_)
+    {
+        if (!estimateGnssAlignment())
+            return;
+    }
+    else if (gnss_realign_interval_ > 0 && gnss_events_since_realign_ >= static_cast<size_t>(gnss_realign_interval_))
+    {
+        estimateGnssAlignment(true);
+    }
+    gnss_events_since_realign_++;
+
+    gnss.aligned_pos = transformGnssToWorld(gnss.enu);
+    gnss.aligned = true;
+    const V3D predicted = _state.pos_end + _state.rot_end * gnss_pos_in_imu;
+    const bool use_msg_cov = gnss_use_msg_cov && gnss.covariance_valid;
+    const double cov_x = std::max(1e-4, use_msg_cov ? gnss.covariance.x() : gnss_default_cov_xy);
+    const double cov_y = std::max(1e-4, use_msg_cov ? gnss.covariance.y() : gnss_default_cov_xy);
+    const double cov_z = std::max(1e-4, use_msg_cov ? gnss.covariance.z() : gnss_default_cov_z);
+    M3D lever_hat;
+    lever_hat << SKEW_SYM_MATRX(gnss_pos_in_imu);
+    const Eigen::MatrixXd rot_jac = -_state.rot_end * lever_hat;
+
+    auto buildGnssMeasurement = [&](const std::string &mode,
+                                    Eigen::MatrixXd &H_out,
+                                    Eigen::VectorXd &residual_out,
+                                    Eigen::MatrixXd &noise_out) {
+        int dim = 3;
+        if (mode == "xy_only")
+            dim = 2;
+        else if (mode == "z_only")
+            dim = 1;
+        else if (!gnss_use_z)
+            dim = 2;
+
+        H_out = Eigen::MatrixXd::Zero(dim, DIM_STATE);
+        residual_out = Eigen::VectorXd::Zero(dim);
+        noise_out = Eigen::MatrixXd::Zero(dim, dim);
+
+        if (mode == "z_only")
+        {
+            residual_out(0) = gnss.aligned_pos.z() - predicted.z();
+            H_out.block<1, 3>(0, 0) = rot_jac.row(2);
+            H_out.block<1, 3>(0, 3) = Eigen::RowVector3d(0.0, 0.0, 1.0);
+            noise_out(0, 0) = cov_z;
+            return;
+        }
+
+        if (dim == 3)
+            residual_out = gnss.aligned_pos - predicted;
+        else
+            residual_out = gnss.aligned_pos.head<2>() - predicted.head<2>();
+
+        H_out.block(0, 0, dim, 3) = rot_jac.topRows(dim);
+        H_out.block(0, 3, dim, 3) = Eigen::MatrixXd::Identity(dim, 3);
+
+        if (dim == 2)
+        {
+            noise_out(0, 0) = cov_x;
+            noise_out(1, 1) = cov_y;
+        }
+        else if (mode == "z_priority")
+        {
+            noise_out(0, 0) = cov_x * 25.0;
+            noise_out(1, 1) = cov_y * 25.0;
+            noise_out(2, 2) = cov_z;
+        }
+        else
+        {
+            noise_out(0, 0) = cov_x;
+            noise_out(1, 1) = cov_y;
+            noise_out(2, 2) = cov_z;
+        }
+    };
+
+    Eigen::MatrixXd H;
+    Eigen::VectorXd residual;
+    Eigen::MatrixXd noise;
+    buildGnssMeasurement(gnss_update_mode_, H, residual, noise);
+    double residual_norm = residual.norm();
+    bool updated = sequentialMeasurementUpdate(H, residual, noise, gnss_gate, "GNSS");
+
+    if (!updated && gnss_fallback_z_only_ && gnss_update_mode_ != "z_only")
+    {
+        Eigen::MatrixXd H_z;
+        Eigen::VectorXd residual_z;
+        Eigen::MatrixXd noise_z;
+        buildGnssMeasurement("z_only", H_z, residual_z, noise_z);
+        updated = sequentialMeasurementUpdate(H_z, residual_z, noise_z, gnss_gate, "GNSS-z-only");
+        if (updated)
+        {
+            residual_norm = residual_z.norm();
+            gnss_fallback_count_++;
+            std::ostringstream oss;
+            oss << "[ GNSS ] fallback to z_only succeeded, residual=" << residual_norm << "\n";
+            logRuntimeMessage(oss.str());
+        }
+    }
+
+    if (updated)
+    {
+        gnss_accept_count_++;
+        gnss_residual_accum_ += residual_norm;
+        ekf_finish_once = true;
+        if (imu_prop_enable)
+        {
+            latest_ekf_state = _state;
+            latest_ekf_time = LidarMeasures.last_lio_update_time;
+            state_update_flg = true;
+        }
+    }
+    else
+    {
+        gnss_reject_count_++;
+    }
+
+    if ((gnss_accept_count_ + gnss_reject_count_) % 50 == 0)
+    {
+        std::ostringstream oss;
+        const double mean_res = gnss_accept_count_ > 0 ? gnss_residual_accum_ / gnss_accept_count_ : 0.0;
+        oss << "[ GNSS ] accept=" << gnss_accept_count_ << ", reject=" << gnss_reject_count_
+            << ", fallback=" << gnss_fallback_count_ << ", mean_residual=" << mean_res
+            << ", update_mode=" << gnss_update_mode_ << "\n";
+        logRuntimeMessage(oss.str());
     }
 }
 
@@ -362,6 +902,7 @@ void LIVMapper::handleVIO()
     if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr))
     {
         std::cout << "[ VIO ] No point!!!" << std::endl;
+        logRuntimeMessage("[ VIO ] No point!!!\n");
         return;
     }
 
@@ -417,6 +958,7 @@ void LIVMapper::handleLIO()
     if (feats_undistort->empty() || (feats_undistort == nullptr))
     {
         std::cout << "[ LIO ]: No point!!!" << std::endl;
+        logRuntimeMessage("[ LIO ]: No point!!!\n");
         return;
     }
 
@@ -500,6 +1042,7 @@ void LIVMapper::handleLIO()
     }
     voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
     std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+    logRuntimeMessage("[ LIO ] Update Voxel Map\n");
     _pv_list = voxelmap_manager->pv_list_;
 
     double t4 = omp_get_wtime();
@@ -553,6 +1096,22 @@ void LIVMapper::handleLIO()
     printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
     printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
     printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+    {
+        std::ostringstream oss;
+        oss << "+-------------------------------------------------------------+\n";
+        oss << "|                         LIO Mapping Time                    |\n";
+        oss << "+-------------------------------------------------------------+\n";
+        oss << "| Algorithm Stage               | Time (secs)                 |\n";
+        oss << "+-------------------------------------------------------------+\n";
+        oss << "| DownSample                    | " << std::fixed << std::setprecision(6) << (t_down - t0) << "                    |\n";
+        oss << "| ICP                           | " << std::fixed << std::setprecision(6) << (t2 - t1) << "                    |\n";
+        oss << "| updateVoxelMap                | " << std::fixed << std::setprecision(6) << (t4 - t3) << "                    |\n";
+        oss << "+-------------------------------------------------------------+\n";
+        oss << "| Current Total Time            | " << std::fixed << std::setprecision(6) << (t4 - t0) << "                    |\n";
+        oss << "| Average Total Time            | " << std::fixed << std::setprecision(6) << aver_time_consu << "                    |\n";
+        oss << "+-------------------------------------------------------------+\n";
+        logRuntimeMessage(oss.str());
+    }
 
     euler_cur = RotMtoEuler(_state.rot_end);
     fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -1041,11 +1600,87 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
     sig_buffer.notify_all();
 }
 
+void LIVMapper::gnss_cbk(const sensor_msgs::NavSatFix::ConstPtr &msg_in)
+{
+    if (!gnss_en)
+        return;
+
+    if (!std::isfinite(msg_in->latitude) || !std::isfinite(msg_in->longitude) || !std::isfinite(msg_in->altitude))
+        return;
+
+    GNSSData data;
+    data.timestamp = msg_in->header.stamp.toSec() - gnss_time_offset;
+    data.latitude = msg_in->latitude;
+    data.longitude = msg_in->longitude;
+    data.altitude = msg_in->altitude;
+    data.covariance_valid = msg_in->position_covariance_type != sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+    if (data.covariance_valid)
+    {
+        data.covariance.x() = std::max(1e-4, msg_in->position_covariance[0]);
+        data.covariance.y() = std::max(1e-4, msg_in->position_covariance[4]);
+        data.covariance.z() = std::max(1e-4, msg_in->position_covariance[8]);
+    }
+
+    if (!gnss_origin_inited)
+    {
+        gnss_origin_lla << data.latitude, data.longitude, data.altitude;
+        gnss_origin_inited = true;
+        ROS_INFO_STREAM("[ GNSS ] ENU origin initialized at LLA = " << gnss_origin_lla.transpose());
+    }
+
+    data.enu = llaToEnu(data.latitude, data.longitude, data.altitude);
+
+    mtx_buffer.lock();
+    if (last_timestamp_gnss > 0.0 && data.timestamp < last_timestamp_gnss)
+    {
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+        ROS_ERROR("[ GNSS ] loop back.");
+        return;
+    }
+    last_timestamp_gnss = data.timestamp;
+    gnss_buffer.push_back(data);
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
+void LIVMapper::wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in)
+{
+    if (!wheel_en)
+        return;
+
+    WheelData data;
+    data.timestamp = msg_in->header.stamp.toSec() - wheel_time_offset;
+    data.linear_velocity << msg_in->twist.twist.linear.x, msg_in->twist.twist.linear.y, msg_in->twist.twist.linear.z;
+    data.angular_velocity << msg_in->twist.twist.angular.x, msg_in->twist.twist.angular.y, msg_in->twist.twist.angular.z;
+    data.position << msg_in->pose.pose.position.x, msg_in->pose.pose.position.y, msg_in->pose.pose.position.z;
+    data.orientation = Eigen::Quaterniond(msg_in->pose.pose.orientation.w,
+                                          msg_in->pose.pose.orientation.x,
+                                          msg_in->pose.pose.orientation.y,
+                                          msg_in->pose.pose.orientation.z);
+    if (data.orientation.norm() > 1e-6)
+    {
+        data.orientation.normalize();
+        data.has_pose = true;
+    }
+
+    mtx_buffer.lock();
+    if (last_timestamp_wheel > 0.0 && data.timestamp < last_timestamp_wheel)
+    {
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+        ROS_ERROR("[ Wheel ] loop back.");
+        return;
+    }
+    last_timestamp_wheel = data.timestamp;
+    wheel_buffer.push_back(data);
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
     if (lid_raw_data_buffer.empty() && lidar_en)
-        return false;
-    if (img_buffer.empty() && img_en)
         return false;
     if (imu_buffer.empty() && imu_en)
         return false;
@@ -1058,35 +1693,42 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
             meas.last_lio_update_time = lid_header_time_buffer.front();
         if (!lidar_pushed)
         {
-            // If not push the lidar into measurement data buffer
-            meas.lidar = lid_raw_data_buffer.front(); // push the first lidar topic
+            meas.lidar = lid_raw_data_buffer.front();
             if (meas.lidar->points.size() <= 1)
                 return false;
 
-            meas.lidar_frame_beg_time = lid_header_time_buffer.front();                                                 // generate lidar_frame_beg_time
-            meas.lidar_frame_end_time = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000); // calc lidar scan end time
+            meas.lidar_frame_beg_time = lid_header_time_buffer.front();
+            meas.lidar_frame_end_time = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000);
             meas.pcl_proc_cur = meas.lidar;
-            lidar_pushed = true; // flag
+            lidar_pushed = true;
+        }
+
+        dropStaleAuxiliaryMeasurements(meas.last_lio_update_time);
+        if (is_first_frame)
+        {
+            const double next_aux_time = std::min(nextWheelTime(), nextGNSSTime());
+            if (next_aux_time + 1e-6 < meas.lidar_frame_end_time)
+            {
+                if (nextWheelTime() <= nextGNSSTime())
+                    return prepareWheelEvent(meas, next_aux_time);
+                return prepareGNSSEvent(meas, next_aux_time);
+            }
         }
 
         if (imu_en && last_timestamp_imu < meas.lidar_frame_end_time)
-        { // waiting imu message needs to be
-            // larger than _lidar_frame_end_time,
-            // make sure complete propagate.
-            // ROS_ERROR("out sync");
             return false;
-        }
 
-        struct MeasureGroup m; // standard method to keep imu message.
-
-        m.imu.clear();
+        MeasureGroup m;
+        m.event_time = meas.lidar_frame_end_time;
         m.lio_time = meas.lidar_frame_end_time;
+        m.imu.clear();
         mtx_buffer.lock();
         while (!imu_buffer.empty())
         {
             if (imu_buffer.front()->header.stamp.toSec() > meas.lidar_frame_end_time)
                 break;
-            m.imu.push_back(imu_buffer.front());
+            if (imu_buffer.front()->header.stamp.toSec() > meas.last_lio_update_time)
+                m.imu.push_back(imu_buffer.front());
             imu_buffer.pop_front();
         }
         lid_raw_data_buffer.pop_front();
@@ -1094,199 +1736,167 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         mtx_buffer.unlock();
         sig_buffer.notify_all();
 
-        meas.lio_vio_flg = LIO; // process lidar topic, so timestamp should be lidar scan end.
+        meas.measures.clear();
         meas.measures.push_back(m);
-        // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");
-        lidar_pushed = false; // sync one whole lidar scan.
+        meas.lio_vio_flg = LIO;
+        lidar_pushed = false;
         return true;
-
-        break;
     }
 
     case LIVO:
     {
-        /*** For LIVO mode, the time of LIO update is set to be the same as VIO, LIO
-         * first than VIO imediatly ***/
-        EKF_STATE last_lio_vio_flg = meas.lio_vio_flg;
-        // double t0 = omp_get_wtime();
-        switch (last_lio_vio_flg)
-        {
-        // double img_capture_time = meas.lidar_frame_beg_time + exposure_time_init;
-        case WAIT:
-        case VIO:
-        {
-            // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
-            double img_capture_time = img_time_buffer.front() + exposure_time_init;
-            /*** has img topic, but img topic timestamp larger than lidar end time,
-             * process lidar topic. After LIO update, the meas.lidar_frame_end_time
-             * will be refresh. ***/
-            if (meas.last_lio_update_time < 0.0)
-                meas.last_lio_update_time = lid_header_time_buffer.front();
-            // printf("[ Data Cut ] wait \n");
-            // printf("[ Data Cut ] last_lio_update_time: %lf \n",
-            // meas.last_lio_update_time);
+        if (meas.last_lio_update_time < 0.0)
+            meas.last_lio_update_time = lid_header_time_buffer.front();
 
-            double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
-            double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
-
-            if (img_capture_time < meas.last_lio_update_time + 0.00001)
-            {
-                img_buffer.pop_front();
-                img_time_buffer.pop_front();
-                ROS_ERROR("[ Data Cut ] Throw one image frame! \n");
+        if (meas.lio_vio_flg == LIO)
+        {
+            if (img_buffer.empty())
                 return false;
-            }
-
-            if (img_capture_time > lid_newest_time || img_capture_time > imu_newest_time)
-            {
-                // ROS_ERROR("lost first camera frame");
-                // printf("img_capture_time, lid_newest_time, imu_newest_time: %lf , %lf
-                // , %lf \n", img_capture_time, lid_newest_time, imu_newest_time);
-                return false;
-            }
-
-            struct MeasureGroup m;
-
-            // printf("[ Data Cut ] LIO \n");
-            // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
-            m.imu.clear();
-            m.lio_time = img_capture_time;
-            mtx_buffer.lock();
-            while (!imu_buffer.empty())
-            {
-                if (imu_buffer.front()->header.stamp.toSec() > m.lio_time)
-                    break;
-
-                if (imu_buffer.front()->header.stamp.toSec() > meas.last_lio_update_time)
-                    m.imu.push_back(imu_buffer.front());
-
-                imu_buffer.pop_front();
-                // printf("[ Data Cut ] imu time: %lf \n",
-                // imu_buffer.front()->header.stamp.toSec());
-            }
-            mtx_buffer.unlock();
-            sig_buffer.notify_all();
-
-            *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-            PointCloudXYZI().swap(*meas.pcl_proc_next);
-
-            int lid_frame_num = lid_raw_data_buffer.size();
-            int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
-            meas.pcl_proc_cur->reserve(max_size);
-            meas.pcl_proc_next->reserve(max_size);
-            // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
-
-            while (!lid_raw_data_buffer.empty())
-            {
-                if (lid_header_time_buffer.front() > img_capture_time)
-                    break;
-                auto pcl(lid_raw_data_buffer.front()->points);
-                double frame_header_time(lid_header_time_buffer.front());
-                float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
-
-                for (int i = 0; i < pcl.size(); i++)
-                {
-                    auto pt = pcl[i];
-                    if (pcl[i].curvature < max_offs_time_ms)
-                    {
-                        pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-                        meas.pcl_proc_cur->points.push_back(pt);
-                    }
-                    else
-                    {
-                        pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-                        meas.pcl_proc_next->points.push_back(pt);
-                    }
-                }
-                lid_raw_data_buffer.pop_front();
-                lid_header_time_buffer.pop_front();
-            }
-
-            meas.measures.push_back(m);
-            meas.lio_vio_flg = LIO;
-            // meas.last_lio_update_time = m.lio_time;
-            // printf("!!! meas.lio_vio_flg: %d \n", meas.lio_vio_flg);
-            // printf("[ Data Cut ] pcl_proc_cur number: %d \n", meas.pcl_proc_cur
-            // ->points.size()); printf("[ Data Cut ] LIO process time: %lf \n",
-            // omp_get_wtime() - t0);
-            return true;
-        }
-
-        case LIO:
-        {
-            double img_capture_time = img_time_buffer.front() + exposure_time_init;
+            const double img_capture_time = img_time_buffer.front() + exposure_time_init;
             meas.lio_vio_flg = VIO;
-            // printf("[ Data Cut ] VIO \n");
             meas.measures.clear();
-            double imu_time = imu_buffer.front()->header.stamp.toSec();
-
-            struct MeasureGroup m;
+            MeasureGroup m;
+            m.event_time = img_capture_time;
             m.vio_time = img_capture_time;
             m.lio_time = meas.last_lio_update_time;
             m.img = img_buffer.front();
             mtx_buffer.lock();
-            // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
-            // {
-            //   imu_time = imu_buffer.front()->header.stamp.toSec();
-            //   if (imu_time > img_capture_time) break;
-            //   m.imu.push_back(imu_buffer.front());
-            //   imu_buffer.pop_front();
-            //   printf("[ Data Cut ] imu time: %lf \n",
-            //   imu_buffer.front()->header.stamp.toSec());
-            // }
             img_buffer.pop_front();
             img_time_buffer.pop_front();
             mtx_buffer.unlock();
             sig_buffer.notify_all();
             meas.measures.push_back(m);
-            lidar_pushed = false; // after VIO update, the _lidar_frame_end_time will be refresh.
-            // printf("[ Data Cut ] VIO process time: %lf \n", omp_get_wtime() - t0);
+            lidar_pushed = false;
             return true;
         }
 
-        default:
+        if (img_buffer.empty())
         {
-            // printf("!! WRONG EKF STATE !!");
+            if (!is_first_frame)
+                return false;
+
+            dropStaleAuxiliaryMeasurements(meas.last_lio_update_time);
+            const double next_aux_time = std::min(nextWheelTime(), nextGNSSTime());
+            if (next_aux_time >= 1e18)
+                return false;
+            if (nextWheelTime() <= nextGNSSTime())
+                return prepareWheelEvent(meas, next_aux_time);
+            return prepareGNSSEvent(meas, next_aux_time);
+        }
+
+        double img_capture_time = img_time_buffer.front() + exposure_time_init;
+        const double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
+        const double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
+
+        if (img_capture_time < meas.last_lio_update_time + 1e-5)
+        {
+            img_buffer.pop_front();
+            img_time_buffer.pop_front();
+            ROS_ERROR("[ Data Cut ] Throw one image frame!");
             return false;
         }
-            // return false;
+
+        dropStaleAuxiliaryMeasurements(meas.last_lio_update_time);
+        if (is_first_frame)
+        {
+            const double next_aux_time = std::min(nextWheelTime(), nextGNSSTime());
+            if (next_aux_time + 1e-6 < img_capture_time)
+            {
+                if (nextWheelTime() <= nextGNSSTime())
+                    return prepareWheelEvent(meas, next_aux_time);
+                return prepareGNSSEvent(meas, next_aux_time);
+            }
         }
-        break;
+
+        if (img_capture_time > lid_newest_time || img_capture_time > imu_newest_time)
+            return false;
+
+        MeasureGroup m;
+        m.event_time = img_capture_time;
+        m.lio_time = img_capture_time;
+        m.imu.clear();
+        mtx_buffer.lock();
+        while (!imu_buffer.empty())
+        {
+            if (imu_buffer.front()->header.stamp.toSec() > m.lio_time)
+                break;
+            if (imu_buffer.front()->header.stamp.toSec() > meas.last_lio_update_time)
+                m.imu.push_back(imu_buffer.front());
+            imu_buffer.pop_front();
+        }
+        mtx_buffer.unlock();
+        sig_buffer.notify_all();
+
+        *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
+        PointCloudXYZI().swap(*meas.pcl_proc_next);
+
+        int lid_frame_num = lid_raw_data_buffer.size();
+        int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
+        meas.pcl_proc_cur->reserve(max_size);
+        meas.pcl_proc_next->reserve(max_size);
+
+        while (!lid_raw_data_buffer.empty())
+        {
+            if (lid_header_time_buffer.front() > img_capture_time)
+                break;
+            auto pcl(lid_raw_data_buffer.front()->points);
+            double frame_header_time(lid_header_time_buffer.front());
+            float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
+
+            for (int i = 0; i < pcl.size(); i++)
+            {
+                auto pt = pcl[i];
+                if (pcl[i].curvature < max_offs_time_ms)
+                {
+                    pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
+                    meas.pcl_proc_cur->points.push_back(pt);
+                }
+                else
+                {
+                    pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
+                    meas.pcl_proc_next->points.push_back(pt);
+                }
+            }
+            lid_raw_data_buffer.pop_front();
+            lid_header_time_buffer.pop_front();
+        }
+
+        meas.measures.clear();
+        meas.measures.push_back(m);
+        meas.lio_vio_flg = LIO;
+        return true;
     }
 
     case ONLY_LO:
     {
         if (!lidar_pushed)
         {
-            // If not in lidar scan, need to generate new meas
             if (lid_raw_data_buffer.empty())
                 return false;
-            meas.lidar = lid_raw_data_buffer.front();                                                                   // push the first lidar topic
-            meas.lidar_frame_beg_time = lid_header_time_buffer.front();                                                 // generate lidar_beg_time
-            meas.lidar_frame_end_time = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000); // calc lidar scan end time
+            meas.lidar = lid_raw_data_buffer.front();
+            meas.lidar_frame_beg_time = lid_header_time_buffer.front();
+            meas.lidar_frame_end_time = meas.lidar_frame_beg_time + meas.lidar->points.back().curvature / double(1000);
             lidar_pushed = true;
         }
-        struct MeasureGroup m; // standard method to keep imu message.
+        MeasureGroup m;
+        m.event_time = meas.lidar_frame_end_time;
         m.lio_time = meas.lidar_frame_end_time;
         mtx_buffer.lock();
         lid_raw_data_buffer.pop_front();
         lid_header_time_buffer.pop_front();
         mtx_buffer.unlock();
         sig_buffer.notify_all();
-        lidar_pushed = false;  // sync one whole lidar scan.
-        meas.lio_vio_flg = LO; // process lidar topic, so timestamp should be lidar scan end.
+        lidar_pushed = false;
+        meas.lio_vio_flg = LO;
+        meas.measures.clear();
         meas.measures.push_back(m);
         return true;
-        break;
     }
 
     default:
-    {
         printf("!! WRONG SLAM TYPE !!");
         return false;
     }
-    }
-    ROS_ERROR("out sync");
 }
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)

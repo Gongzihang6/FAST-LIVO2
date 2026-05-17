@@ -28,7 +28,7 @@ time_offset:
   exposure_time_init: 0.0
 
 gnss:
-  enable: true
+  enable: false
   topic: "/mavros/global_position/raw/fix"
   # 先用一段时间的 GNSS/LIVO 对应点初始化 ENU->FAST-LIVO2 world 对齐
   use_msg_cov: true

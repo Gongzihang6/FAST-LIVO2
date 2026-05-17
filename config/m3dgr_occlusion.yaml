@@ -1,0 +1,125 @@
+common:
+  img_topic: "/camera/color/image_raw"
+  lid_topic: "/livox/mid360/lidar"
+  imu_topic: "/livox/mid360/imu"
+  img_en: 1
+  lidar_en: 1
+  # Occlusion01.bag 的时间戳看起来正常，先关闭驱动修复
+  ros_driver_bug_fix: false
+
+extrin_calib:
+  # LidarToIMU
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
+  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  # LidarToCamera
+  Rcl: [0.0722207, -0.997387, -0.0020542,
+        0.521005,  0.039482, -0.85264,
+        0.850493,  0.060508,  0.522494]
+  Pcl: [-0.0442358, -0.411712, 0.168568]
+
+time_offset:
+  imu_time_offset: 0.0
+  img_time_offset: 0.1
+  gnss_time_offset: 0.0
+  wheel_time_offset: 0.0
+  exposure_time_init: 0.0
+
+gnss:
+  # Occlusion01.bag 没有 GNSS 话题，默认关闭
+  enable: false
+  topic: "/mavros/global_position/raw/fix"
+  use_msg_cov: true
+  use_z: true
+  update_mode: "z_priority"
+  default_cov_xy: 25.0
+  default_cov_z: 64.0
+  gate: 16.0
+  align_min_samples: 20
+  realign_interval: -1
+  align_window_size: 200
+  fallback_z_only: true
+  extrinsic_T: [0.0, 0.0, 0.0]
+
+wheel:
+  # Occlusion01.bag 有 /odom，但作为原始 FAST-LIVO2 启动入口先默认关闭
+  # 后续若要测试紧耦合 wheel，可直接改成 true
+  enable: false
+  topic: "/odom"
+  use_nhc: false
+  forward_cov: 0.5
+  lateral_cov: 0.2
+  gate: 9.0
+  pose_cov_pos: 0.2
+  pose_cov_rot: 0.05
+  extrinsic_T: [1.0000278019634017, 0.00477569625897234, 0.20902387796334685]
+  extrinsic_R: [0.04287356401925391, 0.02354888372915581, 0.9988029373121596,
+                -0.9990699960715406, -0.003575025752803329, 0.04296931626729616,
+                 0.004582625655566386, -0.9997162943885518, 0.02337370907929348]
+
+preprocess:
+  point_filter_num: 1
+  filter_size_surf: 0.1
+  lidar_type: 1
+  scan_line: 4
+  blind: 0.8
+
+vio:
+  max_iterations: 5
+  outlier_threshold: 1000
+  img_point_cov: 100
+  patch_size: 8
+  patch_pyrimid_level: 4
+  normal_en: true
+  raycast_en: false
+  inverse_composition_en: false
+  exposure_estimate_en: true
+  inv_expo_cov: 0.1
+
+imu:
+  imu_en: true
+  imu_int_frame: 30
+  acc_cov: 0.5
+  gyr_cov: 0.3
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+
+lio:
+  max_iterations: 5
+  dept_err: 0.02
+  beam_err: 0.05
+  min_eigen_value: 0.0025
+  voxel_size: 0.5
+  max_layer: 2
+  max_points_num: 50
+  layer_init_num: [5, 5, 5, 5, 5]
+
+local_map:
+  # Occlusion 场景存在遮挡和局部退化，先打开滑动地图减轻长期累积开销
+  map_sliding_en: true
+  half_map_size: 80
+  sliding_thresh: 8
+
+uav:
+  imu_rate_odom: false
+  gravity_align_en: false
+
+publish:
+  dense_map_en: false
+  pub_effect_point_en: false
+  pub_plane_en: false
+  pub_scan_num: 1
+  blind_rgb_points: 0.0
+
+evo:
+  seq_name: "Occlusion01"
+  pose_output_en: true
+
+image_save:
+  img_save_en: false
+  interval: 1
+
+pcd_save:
+  pcd_save_en: false
+  colmap_output_en: false
+  filter_size_pcd: 0.15
+  interval: -1

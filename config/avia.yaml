@@ -17,7 +17,38 @@ extrin_calib:
 time_offset: 
   imu_time_offset: 0.0
   img_time_offset: 0.1
+  gnss_time_offset: 0.0
+  wheel_time_offset: 0.0
   exposure_time_init: 0.0
+
+gnss:
+  enable: false
+  topic: "/mavros/global_position/raw/fix"
+  use_msg_cov: true
+  use_z: true
+  update_mode: "full"
+  default_cov_xy: 25.0
+  default_cov_z: 64.0
+  gate: 16.0
+  align_min_samples: 15
+  realign_interval: -1
+  align_window_size: 200
+  fallback_z_only: true
+  extrinsic_T: [0.0, 0.0, 0.0]
+
+wheel:
+  enable: false
+  topic: "/odom"
+  use_nhc: true
+  forward_cov: 0.5
+  lateral_cov: 0.2
+  gate: 9.0
+  pose_cov_pos: 0.2
+  pose_cov_rot: 0.05
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1, 0, 0,
+                0, 1, 0,
+                0, 0, 1]
 
 preprocess:
   point_filter_num: 1

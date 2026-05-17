@@ -1872,6 +1872,28 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Current Total Time", t7 - t1 - (t5 - t4));
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time", ave_total);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  {
+    std::ostringstream oss;
+    oss << "+-------------------------------------------------------------+\n";
+    oss << "|                         VIO Time                            |\n";
+    oss << "+-------------------------------------------------------------+\n";
+    oss << "| Sparse Map Size               | " << feat_map.size() << "                      |\n";
+    oss << "+-------------------------------------------------------------+\n";
+    oss << "| Algorithm Stage               | Time (secs)                 |\n";
+    oss << "+-------------------------------------------------------------+\n";
+    oss << "| retrieveFromVisualSparseMap   | " << std::fixed << std::setprecision(6) << (t2 - t1) << "                    |\n";
+    oss << "| computeJacobianAndUpdateEKF   | " << std::fixed << std::setprecision(6) << (t3 - t2) << "                    |\n";
+    oss << "| -> computeJacobian            | " << std::fixed << std::setprecision(6) << compute_jacobian_time << "                    |\n";
+    oss << "| -> updateEKF                  | " << std::fixed << std::setprecision(6) << update_ekf_time << "                    |\n";
+    oss << "| generateVisualMapPoints       | " << std::fixed << std::setprecision(6) << (t4 - t3) << "                    |\n";
+    oss << "| updateVisualMapPoints         | " << std::fixed << std::setprecision(6) << (t6 - t5) << "                    |\n";
+    oss << "| updateReferencePatch          | " << std::fixed << std::setprecision(6) << (t7 - t6) << "                    |\n";
+    oss << "+-------------------------------------------------------------+\n";
+    oss << "| Current Total Time            | " << std::fixed << std::setprecision(6) << (t7 - t1 - (t5 - t4)) << "                    |\n";
+    oss << "| Average Total Time            | " << std::fixed << std::setprecision(6) << ave_total << "                    |\n";
+    oss << "+-------------------------------------------------------------+\n";
+    RuntimeLogger::log(oss.str());
+  }
 
   // std::string text = std::to_string(int(1 / (t7 - t1 - (t5 - t4)))) + " HZ";
   // cv::Point2f origin;

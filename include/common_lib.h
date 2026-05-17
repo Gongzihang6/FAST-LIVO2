@@ -20,10 +20,50 @@ which is included as part of this source code package.
 #include <sensor_msgs/Imu.h>
 #include <sophus/se3.h>
 #include <tf/transform_broadcaster.h>
+#include <fstream>
+#include <mutex>
+#include <sstream>
 
 using namespace std;
 using namespace Eigen;
 using namespace Sophus;
+
+class RuntimeLogger
+{
+public:
+	static void init(const std::string &path)
+	{
+		std::lock_guard<std::mutex> lock(mutex_());
+		auto &file = stream_();
+		if (file.is_open())
+			file.close();
+		file.open(path, std::ios::out);
+	}
+
+	static void log(const std::string &message)
+	{
+		std::lock_guard<std::mutex> lock(mutex_());
+		auto &file = stream_();
+		if (file.is_open())
+		{
+			file << message;
+			file.flush();
+		}
+	}
+
+private:
+	static std::ofstream &stream_()
+	{
+		static std::ofstream stream;
+		return stream;
+	}
+
+	static std::mutex &mutex_()
+	{
+		static std::mutex mutex;
+		return mutex;
+	}
+};
 
 // C++ 调试宏。只要在代码里写一句 print_line;，终端就会打印出当前执行到了哪个文件（__FILE__）的第几行（__LINE__）。
 // 用来追踪程序崩溃（段错误）位置或检查代码执行流非常方便。
@@ -68,19 +108,75 @@ enum EKF_STATE
 	WAIT = 0, // 等待状态（数据未准备好或初始化中）
 	VIO = 1,  // 视觉惯性里程计更新阶段（处理图像残差）
 	LIO = 2,  // 激光惯性里程计更新阶段（处理点面匹配残差）
-	LO = 3	  // 纯激光更新阶段
+	LO = 3,	  // 纯激光更新阶段
+	WHEEL = 4, // 轮速计顺序更新阶段
+	GNSS = 5   // GNSS 顺序更新阶段
+};
+
+struct GNSSData
+{
+	double timestamp;
+	double latitude;
+	double longitude;
+	double altitude;
+	V3D enu;
+	V3D covariance;
+	bool covariance_valid;
+	bool aligned;
+	V3D aligned_pos;
+
+	GNSSData()
+	{
+		timestamp = 0.0;
+		latitude = 0.0;
+		longitude = 0.0;
+		altitude = 0.0;
+		enu = V3D::Zero();
+		covariance = V3D::Zero();
+		covariance_valid = false;
+		aligned = false;
+		aligned_pos = V3D::Zero();
+	}
+};
+
+struct WheelData
+{
+	double timestamp;
+	V3D linear_velocity;
+	V3D angular_velocity;
+	V3D position;
+	Quaterniond orientation;
+	bool has_pose;
+
+	WheelData()
+	{
+		timestamp = 0.0;
+		linear_velocity = V3D::Zero();
+		angular_velocity = V3D::Zero();
+		position = V3D::Zero();
+		orientation = Quaterniond::Identity();
+		has_pose = false;
+	}
 };
 
 struct MeasureGroup
 {
+	double event_time;					   // 当前这个顺序更新事件真正发生的时刻
 	double vio_time;					   // 当前视觉帧(Image)对应的时间戳
 	double lio_time;					   // （在纯LIO模式下可能用于记录时间，但通常由 LidarMeasureGroup 接管）
 	deque<sensor_msgs::Imu::ConstPtr> imu; // 双端队列，存储在此视觉帧时间窗口内接收到的所有 IMU 数据
 	cv::Mat img;						   // 当前视觉帧的图像数据（OpenCV 矩阵）
+	bool has_gnss;						   // 当前事件是否携带 GNSS 观测
+	bool has_wheel;						   // 当前事件是否携带轮速计观测
+	GNSSData gnss;						   // 已转换为 ENU 的 GNSS 位置量测
+	WheelData wheel;					   // 轮速计速度量测
 	MeasureGroup()						   // 构造函数，初始化时间戳为0
 	{
+		event_time = 0.0;
 		vio_time = 0.0;
 		lio_time = 0.0;
+		has_gnss = false;
+		has_wheel = false;
 	};
 };
 
@@ -88,7 +184,7 @@ struct LidarMeasureGroup
 {
 	double lidar_frame_beg_time;		 // 当前这一帧激光雷达扫描的起始时间戳
 	double lidar_frame_end_time;		 // 当前这一帧激光雷达扫描的结束时间戳（通常是最后一个点的时间戳）
-	double last_lio_update_time;		 // 上一次完成 LIO 状态更新的时间戳
+	double last_lio_update_time;		 // 上一次完成顺序更新的时间戳，LIO/VIO/Wheel/GNSS 共用同一时间轴
 	PointCloudXYZI::Ptr lidar;			 // 存储当前帧原始的激光雷达点云（XYZ + Intensity）
 	PointCloudXYZI::Ptr pcl_proc_cur;	 // 预处理后（如去畸变、降采样）准备用于当前优化的点云
 	PointCloudXYZI::Ptr pcl_proc_next;	 // （有时用于缓存或跨帧处理）

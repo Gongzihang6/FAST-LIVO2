@@ -19,7 +19,9 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <ctime>
 #include <image_transport/image_transport.h>
+#include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
+#include <sensor_msgs/NavSatFix.h>
 #include <sys/stat.h>
 #include <vikit/camera_loader.h>
 
@@ -55,6 +57,10 @@ public:
 
     // 调度激光雷达处理模块，将当前帧点云与局部地图进行匹配，构建点面距离残差
     void handleLIO();
+
+    // 轮速计与 GNSS 的顺序更新。它们共享当前 IESKF 状态，但各自使用独立的观测模型。
+    void handleWheel();
+    void handleGNSS();
 
     // 工具函数：递归创建目录
     bool createDirectory(const std::string &path);
@@ -95,6 +101,8 @@ public:
     void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
     // 相机图像数据的回调函数。将图像压入 img_buffer
     void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+    void gnss_cbk(const sensor_msgs::NavSatFix::ConstPtr &msg_in);
+    void wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in);
 
     void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
     void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
@@ -111,6 +119,22 @@ public:
     template <typename T>
     Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
     cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg); // 工具函数，将 ROS 的 sensor_msgs::Image 转换为 OpenCV 的 cv::Mat 格式以便图像处理
+    bool buildAuxiliaryEvent(MeasureGroup &measure, double event_time);
+    bool prepareWheelEvent(LidarMeasureGroup &meas, double event_time);
+    bool prepareGNSSEvent(LidarMeasureGroup &meas, double event_time);
+    double nextWheelTime() const;
+    double nextGNSSTime() const;
+    void dropStaleAuxiliaryMeasurements(double reference_time);
+    bool sequentialMeasurementUpdate(const Eigen::MatrixXd &H,
+                                     const Eigen::VectorXd &residual,
+                                     const Eigen::MatrixXd &noise,
+                                     double mahalanobis_gate,
+                                     const std::string &tag);
+    Eigen::Vector3d llaToEnu(double latitude, double longitude, double altitude) const;
+    bool estimateGnssAlignment(bool force_reestimate = false);
+    Eigen::Vector3d transformGnssToWorld(const Eigen::Vector3d &enu) const;
+    void logRuntimeMessage(const std::string &message) const;
+    void applyStateCorrection(const Eigen::Matrix<double, DIM_STATE, 1> &dx);
 
     // C++ 互斥锁。用于保护缓冲区，防止 ROS 回调线程和处理主线程产生数据竞争
     std::mutex mtx_buffer, mtx_buffer_imu_prop;
@@ -121,7 +145,7 @@ public:
 
     string root_dir;    // 日志保存的根目录
     string run_output_dir_; // 本次运行带时间戳的输出子目录
-    string lid_topic, imu_topic, seq_name, img_topic;   // 在 ROS 中订阅的传感器话题名称
+    string lid_topic, imu_topic, seq_name, img_topic, gnss_topic, wheel_topic;   // 在 ROS 中订阅的传感器话题名称
     V3D extT;   // LiDAR 到 IMU 的外参 (平移和旋转)
     M3D extR;
 
@@ -131,10 +155,15 @@ public:
     double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;  // IMU 陀螺仪和加速度计、以及曝光时间的测量噪声协方差（用于 EKF 的观测更新）
     double blind_rgb_points = 0.0;
     double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
+    double last_timestamp_gnss = -1.0, last_timestamp_wheel = -1.0;
     double filter_size_surf_min = 0;    // 点云降采样滤波器的网格大小
     double filter_size_pcd = 0;
     double _first_lidar_time = 0.0;
     double match_time = 0, solve_time = 0, solve_const_H_time = 0;
+    double gnss_time_offset = 0.0, wheel_time_offset = 0.0;
+    double gnss_default_cov_xy = 25.0, gnss_default_cov_z = 64.0, gnss_gate = 16.0;
+    double wheel_forward_cov = 0.5, wheel_lateral_cov = 0.2, wheel_gate = 9.0;
+    double wheel_pose_cov_pos = 0.2, wheel_pose_cov_rot = 0.05;
 
     // 系统运行状态标志 (Flags & States)
     bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
@@ -166,6 +195,10 @@ public:
     bool inverse_composition_en = false;
     bool raycast_en = false;
     int lidar_en = 1;
+    bool gnss_en = false, wheel_en = false;
+    bool gnss_use_msg_cov = true, gnss_use_z = true, wheel_use_nhc = true, wheel_use_pose_delta_ = true;
+    bool gnss_origin_inited = false;
+    bool gnss_align_estimated_ = false;
     bool is_first_frame = false;
     int grid_size, patch_size, grid_n_width, grid_n_height, patch_pyrimid_level;
     double outlier_threshold;
@@ -177,12 +210,36 @@ public:
     deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
     deque<cv::Mat> img_buffer;
     deque<double> img_time_buffer;
+    deque<GNSSData> gnss_buffer;
+    deque<WheelData> wheel_buffer;
     vector<pointWithVar> _pv_list;
     vector<double> extrinT;
     vector<double> extrinR;
     vector<double> cameraextrinT;
     vector<double> cameraextrinR;
+    vector<double> gnssExtrinT;
+    vector<double> wheelExtrinT;
+    vector<double> wheelExtrinR;
     double IMG_POINT_COV;
+    V3D gnss_origin_lla = V3D::Zero();
+    V3D gnss_pos_in_imu = V3D::Zero();
+    V3D wheel_pos_in_imu = V3D::Zero();
+    M3D wheel_rot_in_imu = M3D::Identity();
+    M3D gnss_align_rot_ = M3D::Identity();
+    V3D gnss_align_trans_ = V3D::Zero();
+    std::vector<V3D> gnss_align_enu_samples_;
+    std::vector<V3D> gnss_align_world_samples_;
+    int gnss_align_min_samples_ = 15;
+    int gnss_realign_interval_ = 50;
+    int gnss_align_window_size_ = 200;
+    std::string gnss_update_mode_ = "full";
+    bool gnss_fallback_z_only_ = true;
+    size_t gnss_accept_count_ = 0, gnss_reject_count_ = 0, wheel_accept_count_ = 0, wheel_reject_count_ = 0;
+    size_t gnss_events_since_realign_ = 0, gnss_fallback_count_ = 0;
+    double gnss_residual_accum_ = 0.0, wheel_residual_accum_ = 0.0;
+    WheelData last_wheel_data_;
+    StatesGroup last_wheel_state_;
+    bool last_wheel_state_valid_ = false;
 
     PointCloudXYZI::Ptr visual_sub_map;
     PointCloudXYZI::Ptr feats_undistort;
@@ -194,6 +251,7 @@ public:
     PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
     ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
+    ofstream fout_runtime_log_;
 
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
@@ -218,6 +276,8 @@ public:
     ros::Subscriber sub_pcl;
     ros::Subscriber sub_imu;
     ros::Subscriber sub_img;
+    ros::Subscriber sub_gnss;
+    ros::Subscriber sub_wheel;
     ros::Publisher pubLaserCloudFullRes;
     ros::Publisher pubNormal;
     ros::Publisher pubSubVisualMap;
