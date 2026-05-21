@@ -390,15 +390,18 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
             angvel_avr -= state_inout.bias_g;
             acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
 
+            // 为了避免预积分计算重复，根据head时间戳、上一次预积分计算结束时间戳、tail时间戳
+            // 来计算这两帧IMU的计算时间dt
+            // [ head时间 ] ---- [ last_prop_end_time (即 prop_beg_time) ] ---- [ tail时间 ]
             if (head->header.stamp.toSec() < prop_beg_time) {
                 // printf("00 \n");
                 dt = tail->header.stamp.toSec() - last_prop_end_time;
                 offs_t = tail->header.stamp.toSec() - prop_beg_time;
-            } else if (i != v_imu.size() - 2) { // 
+            } else if (i != v_imu.size() - 2) { // 如果不是倒数第二帧IMU，IMU预积分时间dt就是head和tail时间戳之差
                 // printf("11 \n");
                 dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
                 offs_t = tail->header.stamp.toSec() - prop_beg_time;
-            } else {
+            } else { // 如果是最后一帧，dt就是设定的预积分结束时间prop_end_time减去head时间戳
                 // printf("22 \n");
                 dt = prop_end_time - head->header.stamp.toSec();
                 offs_t = prop_end_time - prop_beg_time;
@@ -407,7 +410,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
             dt_all += dt;
             // printf("[ LIO Propagation ] dt: %lf \n", dt);
 
-            /* covariance propagation */
+            /* covariance propagation 协方差传播 */
             M3D acc_avr_skew;
             M3D Exp_f = Exp(angvel_avr, dt);
             acc_avr_skew << SKEW_SYM_MATRX(acc_avr);
@@ -454,13 +457,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas,
             /* propogation of IMU attitude */
             R_imu = R_imu * Exp_f;
 
-            /* Specific acceleration (global frame) of IMU */
+            /* Specific acceleration (global frame) of IMU IMU在全局坐标系下的加速度*/
             acc_imu = R_imu * acc_avr + state_inout.gravity;
 
-            /* propogation of IMU */
+            /* propogation of IMU 位置的前向传播*/
             pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt;
 
-            /* velocity of IMU */
+            /* velocity of IMU 速度的前向传播*/
             vel_imu = vel_imu + acc_imu * dt;
 
             /* save the poses at each IMU measurements */

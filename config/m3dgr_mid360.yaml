@@ -45,7 +45,7 @@ gnss:
   extrinsic_T: [0.0, 0.0, 0.0]
 
 wheel:
-  enable: false
+  enable: true
   topic: "/odom"
   # 先关闭 NHC 做消融，避免在外参与坐标轴未完全确认前引入错误约束
   use_nhc: false

@@ -259,6 +259,17 @@ void LIVMapper::initializeFiles()
     if (!fout_runtime_log_.is_open())
         ROS_ERROR_STREAM("[LIVMapper] Failed to open: " << run_output_dir_ << "/runtime_terminal.log");
     RuntimeLogger::init(run_output_dir_ + "/runtime_terminal.log");
+    // #region debug-point livmapper-init-files
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] initializeFiles: run_output_dir=" << run_output_dir_
+            << ", pose_output_en=" << (pose_output_en ? "true" : "false")
+            << ", pcd_save_en=" << (pcd_save_en ? "true" : "false")
+            << ", img_save_en=" << (img_save_en ? "true" : "false")
+            << ", runtime_log_open=" << (fout_runtime_log_.is_open() ? "true" : "false") << "\n";
+        RuntimeLogger::log(oss.str());
+    }
+    // #endregion
 }
 
 /*
@@ -315,7 +326,18 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
     // 使用 image_transport（专门用于在 ROS 中高效传输视频流的类）发布图像。它不仅用于监控原始画面，
     // 通常也会叠加上 VIO 直接法追踪到的特征点、极线或光流轨迹，供开发者直观评估当前视觉对齐的效果
     pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
-    
+    // #region debug-point livmapper-init-pubsub
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] initializeSubscribersAndPublishers: lid_topic=" << lid_topic
+            << ", imu_topic=" << imu_topic
+            << ", img_topic=" << img_topic
+            << ", gnss_topic=" << gnss_topic
+            << ", wheel_topic=" << wheel_topic
+            << ", slam_mode=" << slam_mode_ << "\n";
+        logRuntimeMessage(oss.str());
+    }
+    // #endregion
 }
 
 /**
@@ -337,6 +359,14 @@ void LIVMapper::handleFirstFrame()
         p_imu->first_lidar_time = _first_lidar_time; // Only for IMU data log
         is_first_frame = true;
         cout << "FIRST LIDAR FRAME!" << endl;
+        // #region debug-point livmapper-first-frame
+        {
+            std::ostringstream oss;
+            oss << "[ debug ] first lidar frame: first_lidar_time=" << std::fixed << std::setprecision(6)
+                << _first_lidar_time << "\n";
+            logRuntimeMessage(oss.str());
+        }
+        // #endregion
     }
 }
 
@@ -367,6 +397,7 @@ void LIVMapper::processImu()
 {
     // double t0 = omp_get_wtime();
 
+    // 实现IMU静止初始化、IMU预积分预测先验状态、点云去畸变
     p_imu->Process2(LidarMeasures, _state, feats_undistort);
 
     if (gravity_align_en)
@@ -383,6 +414,8 @@ void LIVMapper::processImu()
     // std::cout << "[ Mapping ] predict sta: " << state_propagat.pos_end.transpose() << state_propagat.vel_end.transpose() << std::endl;
 }
 
+
+// 事件分发中心，根据当前时刻获取的数据，使用不同的IESKF更新
 void LIVMapper::stateEstimationAndMapping()
 {
     switch (LidarMeasures.lio_vio_flg)
@@ -403,10 +436,15 @@ void LIVMapper::stateEstimationAndMapping()
     }
 }
 
+/*
+ * 作用：执行状态误差的叠加与协方差的数值稳定。
+ * 功能：将 ESIKF 算出的误差状态向量 dx 更新到系统的绝对名义状态上，并强制协方差矩阵保持绝对对称。
+ * 实现了什么：完成了卡尔曼滤波闭环的最后一步。看似极其简单的两行代码，背后隐藏了复杂的流形（Manifold）数学运算和工程上的数值保护机制。
+ */
 void LIVMapper::applyStateCorrection(const Eigen::Matrix<double, DIM_STATE, 1> &dx)
 {
     _state += dx;
-    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());
+    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());   // 确保协方差矩阵的对称性
 }
 
 /*
@@ -431,7 +469,7 @@ bool LIVMapper::sequentialMeasurementUpdate(const Eigen::MatrixXd &H,
     // innovation 是卡尔曼滤波中著名的新息协方差矩阵 $S$，公式为：$S = H P H ^ T + R$ 
     const Eigen::Matrix<double, DIM_STATE, DIM_STATE> prior_cov = _state.cov;
     const Eigen::MatrixXd innovation = H * prior_cov * H.transpose() + noise;
-    Eigen::LDLT<Eigen::MatrixXd> ldlt(innovation);
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(innovation);  // 对新息协方差矩阵创建ldlt求解器
     if (ldlt.info() != Eigen::Success)
     {
         std::ostringstream oss;
@@ -451,6 +489,7 @@ bool LIVMapper::sequentialMeasurementUpdate(const Eigen::MatrixXd &H,
         return false;
     }
 
+    // 计算卡尔曼增益以及残差预测值dx
     const Eigen::MatrixXd K = prior_cov * H.transpose() * ldlt.solve(Eigen::MatrixXd::Identity(H.rows(), H.rows()));
     Eigen::Matrix<double, DIM_STATE, 1> dx = K * residual;
     applyStateCorrection(dx);
@@ -458,7 +497,7 @@ bool LIVMapper::sequentialMeasurementUpdate(const Eigen::MatrixXd &H,
     const Eigen::Matrix<double, DIM_STATE, DIM_STATE> I = Eigen::Matrix<double, DIM_STATE, DIM_STATE>::Identity();
     const Eigen::Matrix<double, DIM_STATE, DIM_STATE> KH = K * H;
     _state.cov = (I - KH) * prior_cov * (I - KH).transpose() + K * noise * K.transpose();
-    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());
+    _state.cov = 0.5 * (_state.cov + _state.cov.transpose());   // 确保协方差矩阵对称
 
     state_propagat = _state;
     voxelmap_manager->state_ = _state;
@@ -940,7 +979,7 @@ void LIVMapper::handleVIO()
     // }
 
     publish_frame_world(pubLaserCloudFullRes, vio_manager);
-    publish_img_rgb(pubImage, vio_manager);
+    publish_img_rgb(pubImage, vio_manager, LidarMeasures.measures.back().vio_time);
 
     euler_cur = RotMtoEuler(_state.rot_end);
     fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -1220,6 +1259,19 @@ std::string LIVMapper::createTimestampedDir(const std::string &base_dir)
 void LIVMapper::run() {
     ros::Rate rate(5000);
     int idle_count = 0;
+    // #region debug-point livmapper-run-start
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] run loop started: output_dir=" << run_output_dir_
+            << ", slam_mode=" << slam_mode_
+            << ", imu_en=" << (imu_en ? "true" : "false")
+            << ", lidar_en=" << (lidar_en ? "true" : "false")
+            << ", img_en=" << img_en
+            << ", gnss_en=" << (gnss_en ? "true" : "false")
+            << ", wheel_en=" << (wheel_en ? "true" : "false") << "\n";
+        logRuntimeMessage(oss.str());
+    }
+    // #endregion
     while (ros::ok()) {
         ros::spinOnce();
 
@@ -1233,6 +1285,7 @@ void LIVMapper::run() {
                     if (idle_count > 50)
                     {
                         ROS_INFO("All data processed, shutting down...");
+                        logRuntimeMessage("[ debug ] run loop exiting after all data processed\n");
                         break;
                     }
                 }
@@ -1251,6 +1304,15 @@ void LIVMapper::run() {
         stateEstimationAndMapping();
     }
     savePCD();
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] run loop finished: frame_num=" << frame_num
+            << ", has_started=" << (has_started_ ? "true" : "false")
+            << ", last_timestamp_lidar=" << std::fixed << std::setprecision(6) << last_timestamp_lidar
+            << ", last_timestamp_imu=" << last_timestamp_imu
+            << ", last_timestamp_img=" << last_timestamp_img << "\n";
+        logRuntimeMessage(oss.str());
+    }
     ROS_INFO("FAST-LIVO2 finished and saved PCD.");
 }
 
@@ -1410,6 +1472,17 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
     if (!lidar_en)
         return;
+    // #region debug-point livmapper-first-standard-lidar
+    static bool first_standard_lidar_logged = false;
+    if (!first_standard_lidar_logged)
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] first standard lidar callback: t=" << std::fixed << std::setprecision(6)
+            << msg->header.stamp.toSec() << "\n";
+        logRuntimeMessage(oss.str());
+        first_standard_lidar_logged = true;
+    }
+    // #endregion
     mtx_buffer.lock();
 
     double cur_head_time = msg->header.stamp.toSec() + lidar_time_offset;
@@ -1434,6 +1507,17 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
 {
     if (!lidar_en)
         return;
+    // #region debug-point livmapper-first-livox-lidar
+    static bool first_livox_lidar_logged = false;
+    if (!first_livox_lidar_logged)
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] first livox lidar callback: t=" << std::fixed << std::setprecision(6)
+            << msg_in->header.stamp.toSec() << "\n";
+        logRuntimeMessage(oss.str());
+        first_livox_lidar_logged = true;
+    }
+    // #endregion
     mtx_buffer.lock();
     livox_ros_driver::CustomMsg::Ptr msg(new livox_ros_driver::CustomMsg(*msg_in));
     // if ((abs(msg->header.stamp.toSec() - last_timestamp_lidar) > 0.2 && last_timestamp_lidar > 0) || sync_jump_flag)
@@ -1479,6 +1563,17 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
     if (!imu_en)
         return;
+    // #region debug-point livmapper-first-imu
+    static bool first_imu_logged = false;
+    if (!first_imu_logged)
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] first imu callback: t=" << std::fixed << std::setprecision(6)
+            << msg_in->header.stamp.toSec() << "\n";
+        logRuntimeMessage(oss.str());
+        first_imu_logged = true;
+    }
+    // #endregion
 
     if (last_timestamp_lidar < 0.0)
         return;
@@ -1545,6 +1640,17 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
     if (!img_en)
         return;
+    // #region debug-point livmapper-first-image
+    static bool first_image_logged = false;
+    if (!first_image_logged)
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] first image callback: t=" << std::fixed << std::setprecision(6)
+            << msg_in->header.stamp.toSec() << "\n";
+        logRuntimeMessage(oss.str());
+        first_image_logged = true;
+    }
+    // #endregion
     sensor_msgs::Image::Ptr msg(new sensor_msgs::Image(*msg_in));
     // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
     // {
@@ -1648,6 +1754,17 @@ void LIVMapper::wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in)
 {
     if (!wheel_en)
         return;
+    // #region debug-point livmapper-first-wheel
+    static bool first_wheel_logged = false;
+    if (!first_wheel_logged)
+    {
+        std::ostringstream oss;
+        oss << "[ debug ] first wheel callback: t=" << std::fixed << std::setprecision(6)
+            << msg_in->header.stamp.toSec() << "\n";
+        logRuntimeMessage(oss.str());
+        first_wheel_logged = true;
+    }
+    // #endregion
 
     WheelData data;
     data.timestamp = msg_in->header.stamp.toSec() - wheel_time_offset;
@@ -1899,11 +2016,11 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
 }
 
-void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
+void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager, double image_timestamp)
 {
     cv::Mat img_rgb = vio_manager->img_cp;
     cv_bridge::CvImage out_msg;
-    out_msg.header.stamp = ros::Time::now();
+    out_msg.header.stamp = ros::Time().fromSec(image_timestamp);
     // out_msg.header.frame_id = "camera_init";
     out_msg.encoding = sensor_msgs::image_encodings::BGR8;
     out_msg.image = img_rgb;

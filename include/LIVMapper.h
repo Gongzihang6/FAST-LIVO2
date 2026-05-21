@@ -104,7 +104,7 @@ public:
     void gnss_cbk(const sensor_msgs::NavSatFix::ConstPtr &msg_in);
     void wheel_cbk(const nav_msgs::Odometry::ConstPtr &msg_in);
 
-    void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
+    void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager, double image_timestamp);
     void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
     void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
     void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
